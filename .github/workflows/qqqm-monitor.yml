@@ -24,7 +24,7 @@ jobs:
       - name: 安装Python依赖
         run: |
           python -m pip install --upgrade pip
-          pip install pandas curl_cffi exchange_calendars
+          pip install pandas curl_cffi exchange_calendars lxml
 
       - name: QQQM数据检查与破线监控
         env:
@@ -268,16 +268,15 @@ jobs:
 
               if attempt < MAX_FETCH_ATTEMPTS:
                   print(
-                      f"⚠️ 尚未拿到 {expected_date}，"
+                      f"⚠️ Yahoo历史接口尚未提供 {expected_date}，"
                       f"{RETRY_SECONDS} 秒后重试。"
                   )
                   time.sleep(RETRY_SECONDS)
 
-
           if not sources:
               body = (
                   "QQQM自动监控：行情数据获取失败\n\n"
-                  f"检查时间：{now_utc}\n"
+                  f"检查时间UTC：{now_utc}\n"
                   f"NYSE最新应有交易日：{expected_date}\n\n"
                   "两个Yahoo入口均无法取得有效QQQM数据。\n\n"
                   + "\n".join(last_error_text)
@@ -288,7 +287,173 @@ jobs:
 
 
           # ==========================================================
-          # 4. 选择数据源：必须优先选择真正更新到expected_date的源
+          # 4. Yahoo历史接口滞后时，用独立历史网页补齐最新完整交易日
+          # ==========================================================
+          supplemental_source_used = False
+          supplemental_source_name = None
+
+          def fetch_stockanalysis_history():
+              url = "https://stockanalysis.com/etf/qqqm/history/"
+              session = requests.Session(impersonate="chrome")
+              try:
+                  response = session.get(url, timeout=30)
+                  response.raise_for_status()
+                  tables = pd.read_html(response.text)
+
+                  for table in tables:
+                      columns = {str(c).strip() for c in table.columns}
+                      if not {"Date", "Close"}.issubset(columns):
+                          continue
+
+                      required = ["Date", "Open", "High", "Low", "Close"]
+                      if not set(required).issubset(table.columns):
+                          continue
+
+                      df = table.copy()
+                      df["date"] = pd.to_datetime(
+                          df["Date"], errors="coerce"
+                      ).dt.strftime("%Y-%m-%d")
+
+                      for col in ["Open", "High", "Low", "Close"]:
+                          df[col] = pd.to_numeric(
+                              df[col].astype(str).str.replace(",", "", regex=False),
+                              errors="coerce",
+                          )
+
+                      df = df.rename(
+                          columns={
+                              "Open": "open",
+                              "High": "high",
+                              "Low": "low",
+                              "Close": "close",
+                          }
+                      )
+
+                      df = df[["date", "open", "high", "low", "close"]]
+                      df = df.dropna(subset=["date", "close"])
+                      df = df[df["date"] <= expected_date]
+                      return df.sort_values("date").reset_index(drop=True)
+
+                  raise RuntimeError("StockAnalysis历史表未找到")
+              finally:
+                  session.close()
+
+
+          yahoo_latest_date = max(
+              data.iloc[-1]["date"] for data in sources.values()
+          )
+
+          if yahoo_latest_date < expected_date:
+              print("------------------------------------------")
+              print(
+                  f"⚠️ Yahoo历史接口最新到 {yahoo_latest_date}，"
+                  f"目标交易日为 {expected_date}"
+              )
+              print("正在使用独立历史数据源补齐缺失日线。")
+
+              try:
+                  supplemental = fetch_stockanalysis_history()
+                  supplemental_latest = supplemental.iloc[-1]
+
+                  print(
+                      f"StockAnalysis最新交易日：{supplemental_latest['date']}，"
+                      f"收盘：{supplemental_latest['close']:.2f}"
+                  )
+
+                  if supplemental_latest["date"] != expected_date:
+                      raise RuntimeError(
+                          f"StockAnalysis也未更新到 {expected_date}"
+                      )
+
+                  # 用补充源的上一交易日与Yahoo进行连续性校验
+                  previous_supp = supplemental[
+                      supplemental["date"] < expected_date
+                  ]
+                  if previous_supp.empty:
+                      raise RuntimeError("补充源缺少前一交易日数据")
+
+                  supp_prev_row = previous_supp.iloc[-1]
+
+                  yahoo_previous_rows = []
+                  for host, data in sources.items():
+                      prev = data[data["date"] < expected_date]
+                      if not prev.empty:
+                          yahoo_previous_rows.append(prev.iloc[-1])
+
+                  if not yahoo_previous_rows:
+                      raise RuntimeError("Yahoo缺少前一交易日数据，无法连续性校验")
+
+                  yahoo_previous_row = max(
+                      yahoo_previous_rows,
+                      key=lambda row: row["date"]
+                  )
+                  yahoo_previous_close = float(yahoo_previous_row["close"])
+                  supplemental_previous_close = float(supp_prev_row["close"])
+
+                  continuity_difference = abs(
+                      supplemental_previous_close - yahoo_previous_close
+                  ) / yahoo_previous_close
+
+                  print(
+                      f"补充源前一交易日收盘：{supplemental_previous_close:.2f}"
+                  )
+                  print(
+                      f"Yahoo前一交易日收盘：{yahoo_previous_close:.2f}"
+                  )
+                  print(
+                      f"历史连续性差异：{continuity_difference * 100:.4f}%"
+                  )
+
+                  if continuity_difference > PRICE_DIFF_LIMIT:
+                      raise RuntimeError(
+                          "补充源与Yahoo前一交易日收盘不一致"
+                      )
+
+                  missing_rows = supplemental[
+                      supplemental["date"] > yahoo_latest_date
+                  ].copy()
+
+                  if missing_rows.empty:
+                      raise RuntimeError("没有可补齐的新交易日")
+
+                  # 仅把Yahoo缺失的交易日附加进去；已有历史数据不替换
+                  for host in list(sources.keys()):
+                      combined = pd.concat(
+                          [sources[host], missing_rows],
+                          ignore_index=True,
+                      )
+                      combined = (
+                          combined.drop_duplicates(subset=["date"], keep="last")
+                          .sort_values("date")
+                          .reset_index(drop=True)
+                      )
+                      sources[host] = combined
+
+                  supplemental_source_used = True
+                  supplemental_source_name = "StockAnalysis（S&P Global Market Intelligence数据）"
+                  print(
+                      "✅ 已补齐："
+                      + ", ".join(missing_rows["date"].tolist())
+                  )
+
+              except Exception as exc:
+                  body = (
+                      "QQQM自动监控：Yahoo历史数据滞后，备用历史源补齐失败\n\n"
+                      f"检查时间UTC：{now_utc}\n"
+                      f"NYSE最新应有交易日：{expected_date}\n"
+                      f"Yahoo最新：{yahoo_latest_date}\n"
+                      f"错误：{exc}\n\n"
+                      "为防止使用旧行情产生错误投资信号，本次监控停止。\n\n"
+                      "请不要根据本次任务采取投资操作。"
+                  )
+                  send_email("⚠️ QQQM自动监控：行情数据补齐失败", body)
+                  raise RuntimeError(
+                      "无法取得最新完整交易日QQQM数据"
+                  )
+
+
+          # ==========================================================
+          # 5. 选择数据源：必须已经更新到expected_date
           # ==========================================================
           expected_candidates = []
           for host, data in sources.items():
@@ -302,23 +467,30 @@ jobs:
                   }
               )
 
-          reached = [x for x in expected_candidates if x["date"] == expected_date]
+          reached = [
+              x for x in expected_candidates
+              if x["date"] == expected_date
+          ]
 
           if not reached:
-              latest_available = max(expected_candidates, key=lambda x: x["date"])
+              latest_available = max(
+                  expected_candidates,
+                  key=lambda x: x["date"]
+              )
               body = (
                   "QQQM自动监控：行情数据未更新到最新完整交易日\n\n"
                   f"检查时间UTC：{now_utc}\n"
                   f"NYSE最新应有交易日：{expected_date}\n"
                   f"程序实际最新取得：{latest_available['date']}\n"
                   f"QQQM价格：{latest_available['close']:.2f}\n\n"
-                  "已自动重试，但仍未获得最新完整交易日数据。\n"
+                  "Yahoo及备用历史数据均未取得最新完整交易日。\n"
                   "为了防止旧行情产生错误投资信号，本次监控停止。\n\n"
                   "请不要根据本次任务采取投资操作。"
               )
               send_email("⚠️ QQQM自动监控：行情数据过期", body)
               raise RuntimeError("QQQM行情未更新到最新完整交易日")
 
+          # 如果两个Yahoo入口均已更新，则优先选Yahoo；否则任选一个已补齐的源
           reached.sort(key=lambda x: x["host"])
           selected = reached[0]
           latest_date = selected["date"]
@@ -328,37 +500,42 @@ jobs:
           print("------------------------------------------")
           print(f"实际获取最新交易日：{latest_date}")
           print(f"NYSE最新应有交易日：{expected_date}")
-          print(f"选用数据源：{selected['host']}")
+          print(f"选用数据源基础：{selected['host']}")
+          if supplemental_source_used:
+              print(f"最新缺失日补充源：{supplemental_source_name}")
           print(f"QQQM最新收盘：{latest_close:.2f}")
 
 
           # ==========================================================
-          # 5. 双源同日价格交叉检查
+          # 6. Yahoo双入口交叉检查
+          #    若两入口在最新日都已更新，则检查最新日价格；若二者都滞后，
+          #    则前一交易日连续性已经完成交叉校验，不把同一补充源重复算作双源。
           # ==========================================================
-          same_date_prices = [
-              item["close"]
-              for item in expected_candidates
-              if item["date"] == latest_date
-          ]
+          yahoo_latest_candidates = []
+          for host, data in sources.items():
+              row = data.iloc[-1]
+              # 只有真正从Yahoo拿到expected_date的，才计入“Yahoo最新日”交叉检查
+              if not supplemental_source_used or yahoo_latest_date == expected_date:
+                  yahoo_latest_candidates.append(float(row["close"]))
 
-          if len(same_date_prices) >= 2:
-              p1, p2 = same_date_prices[:2]
+          if len(yahoo_latest_candidates) >= 2 and yahoo_latest_date == expected_date:
+              p1, p2 = yahoo_latest_candidates[:2]
               difference = abs(p1 - p2) / p1
-              print(f"query1/query2价格差：{difference * 100:.4f}%")
+              print(f"Yahoo双入口最新日价格差：{difference * 100:.4f}%")
 
               if difference > PRICE_DIFF_LIMIT:
                   body = (
-                      "QQQM自动监控：两个行情源价格不一致\n\n"
+                      "QQQM自动监控：两个Yahoo行情入口最新收盘不一致\n\n"
                       f"交易日：{latest_date}\n"
                       f"价格1：{p1:.4f}\n"
                       f"价格2：{p2:.4f}\n"
                       f"差异：{difference * 100:.4f}%\n\n"
                       "为了避免错误信号，本次监控已经停止。"
                   )
-                  send_email("⚠️ QQQM自动监控：行情源数据不一致", body)
-                  raise RuntimeError("query1/query2价格不一致")
-
-
+                  send_email("⚠️ QQQM自动监控：Yahoo行情源不一致", body)
+                  raise RuntimeError("Yahoo双入口价格不一致")
+          else:
+              print("ℹ️ Yahoo两个历史入口均滞后，本次采用‘Yahoo前一交易日连续性 + 独立历史源补齐’校验。")
           # ==========================================================
           # 6. 计算完整月线
           # ==========================================================
