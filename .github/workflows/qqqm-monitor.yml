@@ -709,6 +709,32 @@ jobs:
           if is_new_completed_month:
               signal_lines.append("本次属于新月份首个完整交易日后的检查窗口")
 
+          report_body = "\n".join(signal_lines)
+
+          report_body += "\n\n均线数值："
+          for n in [5, 10, 20, 30, 60]:
+              report_body += f"\nM{n}：{float(latest_month_row[f'M{n}']):.2f}"
+
+          report_body += "\n\n数据来源："
+          if supplemental_source_used:
+              report_body += "\nYahoo历史接口滞后，本次使用StockAnalysis历史数据补齐最新交易日。"
+          else:
+              report_body += "\nYahoo历史接口已取得最新完整交易日。"
+
+          report_body += "\n\n当前版本说明："
+          report_body += "\n本邮件为QQQM行情与破线监控报告。正式V5.6各档买入金额尚未写入自动化，不应仅依据本邮件直接下单。"
+
           print("\n".join(signal_lines))
+
+          # ==========================================================
+          # 11. 正常运行也发送监控结果邮件
+          # ==========================================================
+          if acute_drop_triggered or any(line_breaks.values()):
+              subject = f"⚠️ QQQM自动监控：{latest_date}检测到条件"
+          else:
+              subject = f"✅ QQQM自动监控：{latest_date}正常"
+
+          send_email(subject, report_body)
+          print("✅ 正常监控结果邮件发送成功")
 
           PY
