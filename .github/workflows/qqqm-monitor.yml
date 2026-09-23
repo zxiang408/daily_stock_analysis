@@ -24,9 +24,9 @@ jobs:
       - name: 安装Python依赖
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas
+          pip install pandas curl_cffi exchange_calendars
 
-      - name: 检查QQQM并发送提醒
+      - name: QQQM数据检查
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -38,260 +38,571 @@ jobs:
           import os
           import smtplib
           from email.message import EmailMessage
-          from datetime import datetime
+          from datetime import datetime, timezone
 
           import pandas as pd
-          import yfinance as yf
+          import exchange_calendars as xcals
+          from curl_cffi import requests
 
 
           TICKER = "QQQM"
 
-          sender = os.environ.get("EMAIL_SENDER", "").strip()
-          password = os.environ.get("EMAIL_PASSWORD", "").strip()
-          receivers_text = os.environ.get("EMAIL_RECEIVERS", "").strip()
-          test_email = os.environ.get("TEST_EMAIL", "false").lower() == "true"
+          EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "").strip()
+          EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "").strip()
+          EMAIL_RECEIVERS_TEXT = os.environ.get(
+              "EMAIL_RECEIVERS", ""
+          ).strip()
 
-          # ==========================
-          # 检查邮箱配置
-          # ==========================
-          if not sender:
-              raise RuntimeError("EMAIL_SENDER 未配置")
+          TEST_EMAIL = (
+              os.environ.get("TEST_EMAIL", "false").lower()
+              == "true"
+          )
 
-          if not password:
-              raise RuntimeError("EMAIL_PASSWORD 未配置")
 
-          receivers = [
+          # ==========================================================
+          # 邮箱配置
+          # ==========================================================
+
+          if not EMAIL_SENDER:
+              raise RuntimeError(
+                  "EMAIL_SENDER 未配置"
+              )
+
+          if not EMAIL_PASSWORD:
+              raise RuntimeError(
+                  "EMAIL_PASSWORD 未配置"
+              )
+
+          EMAIL_RECEIVERS = [
               x.strip()
-              for x in receivers_text.split(",")
+              for x in EMAIL_RECEIVERS_TEXT.split(",")
               if x.strip()
           ]
 
-          if not receivers:
-              receivers = [sender]
+          if not EMAIL_RECEIVERS:
+              EMAIL_RECEIVERS = [EMAIL_SENDER]
 
 
-          # ==========================
-          # 测试邮箱模式
-          # ==========================
-          if test_email:
-              print("==========================================")
-              print("QQQM 自动监控")
-              print("==========================================")
-              print("🧪 当前模式：仅测试邮箱")
-              print("本次不会检查QQQM，也不会产生投资信号。")
+          # ==========================================================
+          # 邮件发送函数
+          # ==========================================================
 
+          def send_email(subject, body):
               msg = EmailMessage()
-              msg["Subject"] = "QQQM自动监控：邮箱测试成功"
-              msg["From"] = sender
-              msg["To"] = ", ".join(receivers)
 
-              msg.set_content(
-                  "这是一封QQQM自动监控测试邮件。\n\n"
-                  "如果你收到这封邮件，说明：\n"
-                  "GitHub Actions → QQ邮箱 SMTP → 收件邮箱\n"
-                  "的通知链路已经正常。\n\n"
-                  "本次运行仅测试邮箱，没有检查QQQM，"
-                  "不会产生投资信号。"
-              )
+              msg["Subject"] = subject
+              msg["From"] = EMAIL_SENDER
+              msg["To"] = ", ".join(EMAIL_RECEIVERS)
+
+              msg.set_content(body)
 
               with smtplib.SMTP_SSL(
                   "smtp.qq.com",
                   465,
                   timeout=30
               ) as server:
-                  server.login(sender, password)
+                  server.login(
+                      EMAIL_SENDER,
+                      EMAIL_PASSWORD
+                  )
                   server.send_message(msg)
+
+
+          # ==========================================================
+          # 邮箱测试模式
+          # ==========================================================
+
+          if TEST_EMAIL:
+              print("==========================================")
+              print("QQQM 自动监控")
+              print("==========================================")
+              print("🧪 当前模式：仅测试邮箱")
+              print("本次不会检查QQQM。")
+
+              send_email(
+                  "QQQM自动监控：邮箱测试成功",
+                  (
+                      "这是一封QQQM自动监控测试邮件。\n\n"
+                      "GitHub Actions → QQ邮箱 SMTP → 收件邮箱\n"
+                      "通知链路正常。\n\n"
+                      "本次运行仅测试邮箱，"
+                      "不会检查QQQM，"
+                      "不会产生投资信号。"
+                  )
+              )
 
               print("✅ 邮箱测试邮件发送成功")
               raise SystemExit(0)
 
 
-          # ==========================
-          # 获取月线数据
-          # ==========================
+          # ==========================================================
+          # 获取NYSE最新已完成交易日
+          # ==========================================================
+
+          now_utc = pd.Timestamp.now(tz="UTC")
+
+          nyse = xcals.get_calendar("XNYS")
+
+          start_date = (
+              now_utc - pd.Timedelta(days=10)
+          ).strftime("%Y-%m-%d")
+
+          end_date = (
+              now_utc + pd.Timedelta(days=1)
+          ).strftime("%Y-%m-%d")
+
+          schedule = nyse.schedule.loc[
+              start_date:end_date
+          ]
+
+          if schedule.empty:
+              raise RuntimeError(
+                  "无法取得NYSE交易日历"
+              )
+
+          if "close" in schedule.columns:
+              close_column = "close"
+          else:
+              close_column = "market_close"
+
+          completed_sessions = schedule[
+              schedule[close_column] <= now_utc
+          ]
+
+          if completed_sessions.empty:
+              raise RuntimeError(
+                  "当前没有已完成的NYSE交易时段"
+              )
+
+          expected_session = completed_sessions.index[-1]
+
+          expected_date = expected_session.strftime(
+              "%Y-%m-%d"
+          )
+
           print("==========================================")
           print("QQQM 自动监控")
           print("==========================================")
-          print(f"检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-          print("模式：QQQM破线检查")
-
-          monthly = yf.Ticker(TICKER).history(
-              period="15y",
-              interval="1mo",
-              auto_adjust=False
+          print(
+              f"检查时间UTC："
+              f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+          )
+          print(
+              f"NYSE最新应有交易日："
+              f"{expected_date}"
           )
 
-          if monthly.empty:
-              raise RuntimeError("无法获取QQQM月线数据")
 
-          monthly = monthly.dropna(subset=["Close"]).copy()
+          # ==========================================================
+          # Yahoo Finance Chart API
+          # 使用 query1 + query2 两个入口
+          # ==========================================================
 
-          if monthly.index.tz is None:
-              monthly.index = monthly.index.tz_localize("UTC")
-
-          monthly["month"] = (
-              monthly.index
-              .tz_convert("Asia/Shanghai")
-              .to_period("M")
-          )
-
-          now = pd.Timestamp.now(tz="Asia/Shanghai")
-          current_month = now.to_period("M")
-
-          # 排除当前尚未结束的月份
-          monthly = monthly[
-              monthly["month"] < current_month
-          ].copy()
-
-          if len(monthly) < 60:
-              raise RuntimeError(
-                  f"有效月线数据不足60个月，当前只有 {len(monthly)} 个月"
+          def fetch_yahoo(host):
+              url = (
+                  f"https://{host}/v8/finance/chart/"
+                  f"{TICKER}"
               )
+
+              params = {
+                  "range": "15y",
+                  "interval": "1d",
+                  "events": "div,splits",
+                  "includeAdjustedClose": "true"
+              }
+
+              session = requests.Session(
+                  impersonate="chrome"
+              )
+
+              try:
+                  response = session.get(
+                      url,
+                      params=params,
+                      timeout=30
+                  )
+
+                  response.raise_for_status()
+
+                  payload = response.json()
+
+                  result = (
+                      payload
+                      .get("chart", {})
+                      .get("result")
+                  )
+
+                  if not result:
+                      raise RuntimeError(
+                          "Yahoo返回结果为空"
+                      )
+
+                  result = result[0]
+
+                  timestamps = result.get(
+                      "timestamp", []
+                  )
+
+                  quote_data = (
+                      result
+                      .get("indicators", {})
+                      .get("quote", [])
+                  )
+
+                  if not timestamps or not quote_data:
+                      raise RuntimeError(
+                          "Yahoo行情数据结构异常"
+                      )
+
+                  closes = quote_data[0].get(
+                      "close", []
+                  )
+
+                  if len(timestamps) != len(closes):
+                      raise RuntimeError(
+                          "Yahoo时间与价格长度不一致"
+                      )
+
+                  timezone_name = (
+                      result
+                      .get("meta", {})
+                      .get(
+                          "exchangeTimezoneName",
+                          "America/New_York"
+                      )
+                  )
+
+                  rows = []
+
+                  for ts, close in zip(
+                      timestamps,
+                      closes
+                  ):
+                      if close is None:
+                          continue
+
+                      dt = pd.Timestamp(
+                          ts,
+                          unit="s",
+                          tz="UTC"
+                      ).tz_convert(
+                          timezone_name
+                      )
+
+                      rows.append({
+                          "timestamp": dt,
+                          "date": dt.strftime("%Y-%m-%d"),
+                          "close": float(close)
+                      })
+
+                  if not rows:
+                      raise RuntimeError(
+                          "Yahoo没有有效收盘价"
+                      )
+
+                  df = pd.DataFrame(rows)
+
+                  df = df.drop_duplicates(
+                      subset=["date"],
+                      keep="last"
+                  )
+
+                  df = df.sort_values("timestamp")
+
+                  return df
+
+              finally:
+                  session.close()
+
+
+          # ==========================================================
+          # 同时获取 query1 / query2
+          # ==========================================================
+
+          sources = {}
+
+          for host in [
+              "query1.finance.yahoo.com",
+              "query2.finance.yahoo.com"
+          ]:
+              try:
+                  print(
+                      f"正在获取数据：{host}"
+                  )
+
+                  data = fetch_yahoo(host)
+
+                  latest_row = data.iloc[-1]
+
+                  print(
+                      f"{host} 最新交易日："
+                      f"{latest_row['date']}"
+                  )
+
+                  print(
+                      f"{host} 最新收盘："
+                      f"{latest_row['close']:.2f}"
+                  )
+
+                  sources[host] = data
+
+              except Exception as exc:
+                  print(
+                      f"⚠️ {host} 获取失败："
+                      f"{exc}"
+                  )
+
+
+          # ==========================================================
+          # 至少一个Yahoo入口必须成功
+          # ==========================================================
+
+          if not sources:
+              body = (
+                  "QQQM自动监控：行情数据获取失败\n\n"
+                  f"检查时间：{now_utc}\n"
+                  "query1 和 query2 均无法获取QQQM数据。\n\n"
+                  "本次没有产生任何投资信号。"
+              )
+
+              send_email(
+                  "❌ QQQM自动监控：行情数据获取失败",
+                  body
+              )
+
+              raise RuntimeError(
+                  "query1/query2均无法获取QQQM"
+              )
+
+
+          # ==========================================================
+          # 找到最新交易数据源
+          # ==========================================================
+
+          candidates = []
+
+          for host, data in sources.items():
+              row = data.iloc[-1]
+
+              candidates.append({
+                  "host": host,
+                  "date": row["date"],
+                  "close": float(row["close"]),
+                  "data": data
+              })
+
+          candidates.sort(
+              key=lambda x: x["date"],
+              reverse=True
+          )
+
+          selected = candidates[0]
+
+          latest_date = selected["date"]
+          latest_close = selected["close"]
+          daily = selected["data"]
+
+
+          # ==========================================================
+          # 数据新鲜度检查
+          # ==========================================================
+
+          print("------------------------------------------")
+          print(
+              f"实际获取最新交易日："
+              f"{latest_date}"
+          )
+
+          print(
+              f"NYSE最新应有交易日："
+              f"{expected_date}"
+          )
+
+          print(
+              f"选用数据源："
+              f"{selected['host']}"
+          )
+
+          print(
+              f"QQQM最新收盘："
+              f"{latest_close:.2f}"
+          )
+          print("------------------------------------------")
+
+
+          if latest_date != expected_date:
+
+              body = (
+                  "QQQM自动监控：行情数据未更新到最新交易日\n\n"
+                  f"检查时间UTC：{now_utc}\n"
+                  f"NYSE最新应有交易日：{expected_date}\n"
+                  f"程序实际拿到：{latest_date}\n"
+                  f"QQQM价格：{latest_close:.2f}\n\n"
+                  "为了防止使用旧行情产生错误投资信号，"
+                  "本次监控已经自动停止。\n\n"
+                  "请不要根据本次任务采取投资操作。"
+              )
+
+              send_email(
+                  "⚠️ QQQM自动监控：行情数据过期",
+                  body
+              )
+
+              raise RuntimeError(
+                  "QQQM行情未更新到最新交易日"
+              )
+
+
+          # ==========================================================
+          # 两个Yahoo入口如果同日，进行价格交叉检查
+          # ==========================================================
+
+          same_date_prices = [
+              item["close"]
+              for item in candidates
+              if item["date"] == latest_date
+          ]
+
+          if len(same_date_prices) >= 2:
+
+              p1 = same_date_prices[0]
+              p2 = same_date_prices[1]
+
+              difference = abs(p1 - p2) / p1
+
+              print(
+                  f"query1/query2价格差："
+                  f"{difference * 100:.4f}%"
+              )
+
+              if difference > 0.002:
+
+                  body = (
+                      "QQQM自动监控：两个行情源价格不一致\n\n"
+                      f"交易日：{latest_date}\n"
+                      f"价格1：{p1:.4f}\n"
+                      f"价格2：{p2:.4f}\n"
+                      f"差异：{difference * 100:.4f}%\n\n"
+                      "为了避免错误信号，本次监控已经停止。"
+                  )
+
+                  send_email(
+                      "⚠️ QQQM自动监控：行情源数据不一致",
+                      body
+                  )
+
+                  raise RuntimeError(
+                      "query1/query2价格不一致"
+                  )
+
+
+          # ==========================================================
+          # 计算月线收盘
+          # ==========================================================
+
+          daily["month"] = (
+              pd.to_datetime(
+                  daily["date"]
+              ).dt.to_period("M")
+          )
+
+          monthly_close = (
+              daily
+              .groupby("month")["close"]
+              .last()
+              .sort_index()
+          )
+
+
+          # 删除当前尚未完成月份
+          current_month = (
+              pd.Timestamp.now(
+                  tz="Asia/Shanghai"
+              ).to_period("M")
+          )
+
+          monthly_close = monthly_close[
+              monthly_close.index < current_month
+          ]
+
+
+          if len(monthly_close) < 60:
+
+              raise RuntimeError(
+                  "有效月线数据不足60个月"
+              )
+
+
+          # ==========================================================
+          # 计算月均线
+          # ==========================================================
+
+          monthly = pd.DataFrame({
+              "Close": monthly_close
+          })
 
           for n in [5, 10, 20, 30, 60]:
               monthly[f"M{n}"] = (
-                  monthly["Close"].rolling(n).mean()
+                  monthly["Close"]
+                  .rolling(n)
+                  .mean()
               )
 
           latest_month = monthly.iloc[-1]
 
 
-          # ==========================
-          # 获取日线数据
-          # ==========================
-          daily = yf.Ticker(TICKER).history(
-              period="1mo",
-              interval="1d",
-              auto_adjust=False
+          # ==========================================================
+          # 输出最终监控结果
+          # ==========================================================
+
+          print("==========================================")
+          print("QQQM 最新有效数据")
+          print("==========================================")
+
+          print(
+              f"交易日：{latest_date}"
           )
 
-          if daily.empty:
-              raise RuntimeError("无法获取QQQM日线数据")
-
-          daily = daily.dropna(subset=["Close"]).copy()
-
-          if daily.empty:
-              raise RuntimeError("QQQM日线数据为空")
-
-          latest = daily.iloc[-1]
-          latest_date = daily.index[-1]
-
-          current_close = float(latest["Close"])
-
-
-          # ==========================
-          # 输出指标
-          # ==========================
-          print("------------------------------------------")
-          print(f"最新交易日：{latest_date}")
-          print(f"QQQM 收盘价：{current_close:.2f}")
-          print("------------------------------------------")
+          print(
+              f"QQQM 收盘价："
+              f"{latest_close:.2f}"
+          )
 
           for n in [5, 10, 20, 30, 60]:
-              ma = latest_month[f"M{n}"]
 
-              if pd.isna(ma):
-                  print(f"M{n}: 数据不足")
+              value = latest_month[f"M{n}"]
+
+              if pd.isna(value):
+
+                  print(
+                      f"M{n}：数据不足"
+                  )
+
               else:
-                  print(f"M{n}: {float(ma):.2f}")
+
+                  print(
+                      f"M{n}："
+                      f"{float(value):.2f}"
+                  )
 
 
-          # ==========================
-          # 破线判断
-          # ==========================
-          signals = []
-
-          for n in [5, 10, 20, 30, 60]:
-              ma = latest_month[f"M{n}"]
-
-              if pd.isna(ma):
-                  continue
-
-              ma = float(ma)
-
-              if current_close <= ma:
-                  signals.append((f"M{n}", ma))
+          print("==========================================")
+          print("✅ 行情数据通过新鲜度检查")
+          print("✅ 两个Yahoo入口价格交叉检查通过")
+          print("✅ 当前仅执行数据监控")
+          print("==========================================")
 
 
-          # ==========================
-          # 没有破线
-          # ==========================
-          if not signals:
-              print("------------------------------------------")
-              print("✅ 当前没有发现破线信号")
-              print("不会发送邮件。")
-              print("------------------------------------------")
-              raise SystemExit(0)
+          # ==========================================================
+          # 暂时不产生投资信号
+          # ==========================================================
 
-
-          # ==========================
-          # 发现破线
-          # ==========================
-          print("------------------------------------------")
-          print("🚨 发现破线信号")
-          print("------------------------------------------")
-
-          for name, ma in signals:
-              print(
-                  f"{name}: "
-                  f"QQQM {current_close:.2f} <= {ma:.2f}"
-              )
-
-
-          # ==========================
-          # 生成提醒邮件
-          # ==========================
-          signal_names = ", ".join(
-              name for name, _ in signals
+          print(
+              "ℹ️ 当前版本尚未执行最终V5.6投资纪律。"
           )
 
-          subject = (
-              f"🚨 QQQM破线提醒：{signal_names}"
+          print(
+              "ℹ️ 下一步将在此基础上加入正式破线规则。"
           )
 
-          body_lines = [
-              "QQQM 自动监控提醒",
-              "",
-              f"最新交易日：{latest_date}",
-              f"QQQM 收盘价：{current_close:.2f}",
-              "",
-              "触发的破线条件："
-          ]
-
-          for name, ma in signals:
-              body_lines.append(
-                  f"{name}："
-                  f"QQQM {current_close:.2f} <= {ma:.2f}"
-              )
-
-          body_lines.extend([
-              "",
-              "本邮件仅表示技术条件被触发。",
-              "是否执行你的QQQM投资纪律，"
-              "按照你最终确定的V5.6规则处理。"
-          ])
-
-          msg = EmailMessage()
-          msg["Subject"] = subject
-          msg["From"] = sender
-          msg["To"] = ", ".join(receivers)
-          msg.set_content("\n".join(body_lines))
-
-
-          # ==========================
-          # 发送邮件
-          # ==========================
-          print("------------------------------------------")
-          print("正在发送破线提醒邮件...")
-
-          with smtplib.SMTP_SSL(
-              "smtp.qq.com",
-              465,
-              timeout=30
-          ) as server:
-              server.login(sender, password)
-              server.send_message(msg)
-
-          print("✅ 破线提醒邮件发送成功")
-          print("------------------------------------------")
           PY
