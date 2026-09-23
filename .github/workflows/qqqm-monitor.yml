@@ -275,10 +275,7 @@ jobs:
           msg["Subject"] = subject
           msg["From"] = sender
           msg["To"] = ", ".join(receivers)
-
-          msg.set_content(
-              "\n".join(body_lines)
-          )
+          msg.set_content("\n".join(body_lines))
 
 
           # ==========================
