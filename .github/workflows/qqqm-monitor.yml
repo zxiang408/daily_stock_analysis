@@ -24,7 +24,7 @@ jobs:
       - name: 安装Python依赖
         run: |
           python -m pip install --upgrade pip
-          pip install pandas curl_cffi exchange_calendars lxml
+          pip install pandas curl_cffi exchange_calendars
 
       - name: QQQM数据检查与破线监控
         env:
@@ -36,6 +36,7 @@ jobs:
         run: |
           python <<'PY'
           import os
+          import re
           import smtplib
           import time
           from email.message import EmailMessage
@@ -293,48 +294,64 @@ jobs:
           supplemental_source_name = None
 
           def fetch_stockanalysis_history():
+              """
+              从StockAnalysis页面的内嵌结构化数据中提取日线。
+
+              不使用pd.read_html，因为该页面为Svelte动态页面，
+              HTML表格解析在GitHub Actions上可能失败；页面源码本身
+              已包含形如：
+              {a:...,c:...,h:...,l:...,o:...,t:"YYYY-MM-DD",v:...}
+              的历史数据对象。
+              """
+
               url = "https://stockanalysis.com/etf/qqqm/history/"
               session = requests.Session(impersonate="chrome")
+
+              number = r"-?(?:\d+(?:\.\d+)?|\.\d+)"
+              pattern = re.compile(
+                  rf'\{{a:(?P<a>{number}),c:(?P<c>{number}),h:(?P<h>{number}),l:(?P<l>{number}),o:(?P<o>{number}),t:"(?P<t>\d{{4}}-\d{{2}}-\d{{2}})"'
+              )
+
               try:
                   response = session.get(url, timeout=30)
                   response.raise_for_status()
-                  tables = pd.read_html(response.text)
+                  html = response.text
 
-                  for table in tables:
-                      columns = {str(c).strip() for c in table.columns}
-                      if not {"Date", "Close"}.issubset(columns):
-                          continue
+                  matches = list(pattern.finditer(html))
 
-                      required = ["Date", "Open", "High", "Low", "Close"]
-                      if not set(required).issubset(table.columns):
-                          continue
+                  if not matches:
+                      raise RuntimeError(
+                          "StockAnalysis页面未找到内嵌QQQM历史数据"
+                      )
 
-                      df = table.copy()
-                      df["date"] = pd.to_datetime(
-                          df["Date"], errors="coerce"
-                      ).dt.strftime("%Y-%m-%d")
-
-                      for col in ["Open", "High", "Low", "Close"]:
-                          df[col] = pd.to_numeric(
-                              df[col].astype(str).str.replace(",", "", regex=False),
-                              errors="coerce",
-                          )
-
-                      df = df.rename(
-                          columns={
-                              "Open": "open",
-                              "High": "high",
-                              "Low": "low",
-                              "Close": "close",
+                  rows = []
+                  for match in matches:
+                      rows.append(
+                          {
+                              "date": match.group("t"),
+                              "open": float(match.group("o")),
+                              "high": float(match.group("h")),
+                              "low": float(match.group("l")),
+                              "close": float(match.group("c")),
                           }
                       )
 
-                      df = df[["date", "open", "high", "low", "close"]]
-                      df = df.dropna(subset=["date", "close"])
-                      df = df[df["date"] <= expected_date]
-                      return df.sort_values("date").reset_index(drop=True)
+                  df = pd.DataFrame(rows)
+                  df = df.drop_duplicates(subset=["date"], keep="last")
+                  df = df.sort_values("date").reset_index(drop=True)
+                  df = df[df["date"] <= expected_date].copy()
 
-                  raise RuntimeError("StockAnalysis历史表未找到")
+                  if df.empty:
+                      raise RuntimeError(
+                          "StockAnalysis没有不晚于应有交易日的数据"
+                      )
+
+                  print(
+                      f"StockAnalysis共解析 {len(df)} 个有效交易日"
+                  )
+
+                  return df
+
               finally:
                   session.close()
 
