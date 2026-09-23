@@ -1,0 +1,183 @@
+name: QQQM破线监控
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+      timezone: 'Asia/Shanghai'
+
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: 安装Python依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas
+
+      - name: 检查QQQM并发送提醒
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
+        run: |
+          python <<'PY'
+          import os
+          import smtplib
+          from email.message import EmailMessage
+          from datetime import datetime
+
+          import pandas as pd
+          import yfinance as yf
+
+
+          TICKER = "QQQM"
+
+          sender = os.environ.get("EMAIL_SENDER", "").strip()
+          password = os.environ.get("EMAIL_PASSWORD", "").strip()
+          receivers_text = os.environ.get("EMAIL_RECEIVERS", "").strip()
+
+          if not sender:
+              raise RuntimeError("EMAIL_SENDER 未配置")
+
+          if not password:
+              raise RuntimeError("EMAIL_PASSWORD 未配置")
+
+          receivers = [
+              x.strip()
+              for x in receivers_text.split(",")
+              if x.strip()
+          ]
+
+          if not receivers:
+              receivers = [sender]
+
+
+          # 获取近15年月线数据，确保M60有足够历史数据
+          monthly = yf.Ticker(TICKER).history(
+              period="15y",
+              interval="1mo",
+              auto_adjust=False
+          )
+
+          if monthly.empty:
+              raise RuntimeError("无法获取QQQM月线数据")
+
+          monthly = monthly.dropna(subset=["Close"]).copy()
+
+          # 排除当前尚未结束的月份
+          now = pd.Timestamp.now(tz="UTC")
+          if monthly.index.tz is None:
+              monthly.index = monthly.index.tz_localize("UTC")
+
+          monthly["month"] = monthly.index.tz_convert("Asia/Shanghai").to_period("M")
+          current_month = now.tz_convert("Asia/Shanghai").to_period("M")
+
+          monthly = monthly[monthly["month"] < current_month].copy()
+
+          for n in [5, 10, 20, 30, 60]:
+              monthly[f"M{n}"] = monthly["Close"].rolling(n).mean()
+
+          latest_month = monthly.iloc[-1]
+
+          # 获取最近15个交易日，寻找最新完成的美股交易日收盘
+          daily = yf.Ticker(TICKER).history(
+              period="1mo",
+              interval="1d",
+              auto_adjust=False
+          )
+
+          if daily.empty:
+              raise RuntimeError("无法获取QQQM日线数据")
+
+          daily = daily.dropna(subset=["Close"]).copy()
+
+          latest = daily.iloc[-1]
+          latest_date = daily.index[-1]
+
+          current_close = float(latest["Close"])
+
+          # 前一个交易日，用于判断是否是“首次跌破”
+          previous_close = None
+          if len(daily) >= 2:
+              previous_close = float(daily.iloc[-2]["Close"])
+
+          signals = []
+
+          for n in [5, 10, 20, 30, 60]:
+              ma = latest_month[f"M{n}"]
+
+              if pd.isna(ma):
+                  continue
+
+              ma = float(ma)
+
+              # 当前收盘价已经低于月线
+              if current_close <= ma:
+                  # 如果有前一个交易日，并且前一天还在月线上方，
+                  # 则认定为“本次首次跌破”
+                  if previous_close is None or previous_close > ma:
+                      signals.append((f"M{n}", ma))
+
+          print("==========================================")
+          print("QQQM 自动监控")
+          print("==========================================")
+          print(f"检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+          print(f"最新交易日：{latest_date}")
+          print(f"QQQM 收盘价：{current_close:.2f}")
+
+          for n in [5, 10, 20, 30, 60]:
+              ma = latest_month[f"M{n}"]
+              if pd.isna(ma):
+                  print(f"M{n}: 数据不足")
+              else:
+                  print(f"M{n}: {float(ma):.2f}")
+
+          if not signals:
+              print("✅ 本次没有发现新的破线信号")
+              raise SystemExit(0)
+
+          print("🚨 发现新的破线信号：")
+          for name, ma in signals:
+              print(f"  {name}: QQQM {current_close:.2f} <= {ma:.2f}")
+
+
+          # 生成邮件
+          subject = f"🚨 QQQM破线提醒：{', '.join(name for name, _ in signals)}"
+
+          body_lines = [
+              "QQQM 自动监控提醒",
+              "",
+              f"最新交易日：{latest_date}",
+              f"QQQM 收盘价：{current_close:.2f}",
+              "",
+              "新增破线："
+          ]
+
+          for name, ma in signals:
+              body_lines.append(
+                  f"{name}：QQQM {current_close:.2f} <= {ma:.2f}"
+              )
+
+          body_lines.extend([
+              "",
+              "本邮件仅表示技术条件被触发。",
+              "是否执行你的QQQM投资纪律，按照你最终确定的V5.6规则处理。"
+          ])
+
+          msg = EmailMessage()
+          msg["Subject"] = subject
+          msg["From"] = sender
+          msg["To"] = ", ".join(receivers)
+          msg.set_content("\n".join(body_lines))
+
+          with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=30) as server:
+              server.login(sender, password)
+              server.send_message(msg)
+
+          print("✅ 破线提醒邮件发送成功")
+          PY
