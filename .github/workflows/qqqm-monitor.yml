@@ -56,6 +56,24 @@ jobs:
           PRICE_DIFF_LIMIT = 0.002
           ACUTE_DROP_THRESHOLD = 0.10
 
+          # ==========================================================
+          # V5.6 执行配置
+          # ==========================================================
+          # 你已经确认的基础月度定投金额：$800。
+          # 破线五档金额必须使用你最终确认的纪律表；当前对话中
+          # 的现成YAML没有保留这五个具体数字，因此这里先留空。
+          # 一旦任何破线信号需要金额而金额为空，程序会“只报警、不报买入金额”，
+          # 防止自动化凭空猜测导致错误下单。
+          BASE_MONTHLY_BUY = 800.0
+          BREAK_BUY_AMOUNTS = {
+              5: None,
+              10: None,
+              20: None,
+              30: None,
+              60: None,
+          }
+          ACUTE_DROP_BUY = None
+
           EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "").strip()
           EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "").strip()
           EMAIL_RECEIVERS_TEXT = os.environ.get("EMAIL_RECEIVERS", "").strip()
@@ -673,68 +691,204 @@ jobs:
 
 
           # ==========================================================
-          # 10. 最终输出
+          # 10. V5.6 执行资格判断
           # ==========================================================
-          print("==========================================")
-          print("✅ 行情数据新鲜度检查通过")
-          print("✅ 两个Yahoo入口交叉检查通过")
-          print("✅ 月线M5/M10/M20/M30/M60计算完成")
-          print("✅ 破线状态计算完成")
-          print("✅ 10%月中急跌条件计算完成")
-          print("==========================================")
+          # 本月第一个美股交易日：执行一次基础月度定投资格判断
+          current_session_month = pd.Period(expected_date, freq="M")
+          current_month_schedule = nyse.schedule.loc[
+              f"{current_session_month.start_time.date()}":
+              f"{current_session_month.end_time.date()}"
+          ]
+          if current_month_schedule.empty:
+              raise RuntimeError("无法取得当前月份NYSE交易日历")
 
-          # 注意：这里故意不擅自写入最终V5.6买入金额。
-          # 你当前贴出的YAML只包含行情与均线监控，没有包含你最终确认的
-          # V5.6“各破线档位具体买入金额”文本。
-          # 先把数据层固定，避免把2022年12月那类金额错配重新写进自动化。
+          first_session_of_current_month = current_month_schedule.index[0].strftime("%Y-%m-%d")
+          is_first_trading_day_of_month = (
+              expected_date == first_session_of_current_month
+          )
 
+          # 月线破线信号只在新月份第一个完整交易日确认一次，避免每天重复提醒
+          monthly_break_signal_today = (
+              is_new_completed_month and any(line_breaks.values())
+          )
+
+          # 10%急跌只在“首次跌破阈值的那个交易日”发出买入信号，
+          # 避免之后每一天重复报警。
+          acute_drop_signal_today = (
+              acute_drop_triggered and acute_drop_date == expected_date
+          )
+
+          # 计算需要的破线金额；None表示尚未配置，绝不自行猜测
+          broken_lines_today = [
+              n for n in [5, 10, 20, 30, 60] if line_breaks[n]
+          ]
+
+          missing_break_amounts = [
+              n for n in broken_lines_today
+              if BREAK_BUY_AMOUNTS.get(n) is None
+          ]
+
+          break_buy_total = 0.0
+          if not missing_break_amounts:
+              break_buy_total = sum(
+                  float(BREAK_BUY_AMOUNTS[n]) for n in broken_lines_today
+              )
+
+          execution_items = []
+          execution_safe = True
+
+          # 基础月度定投：仅在本月第一个美股交易日进入执行资格
+          if is_first_trading_day_of_month:
+              execution_items.append(
+                  f"基础月度定投：${BASE_MONTHLY_BUY:,.0f}（本月首个美股交易日）"
+              )
+
+          if monthly_break_signal_today:
+              if missing_break_amounts:
+                  execution_items.append(
+                      "月线破线：已触发，但破线金额配置缺失，暂不输出可执行买入金额"
+                  )
+                  execution_items.append(
+                      "缺失金额档位："
+                      + ", ".join(f"M{n}" for n in missing_break_amounts)
+                  )
+                  execution_safe = False
+              else:
+                  execution_items.append(
+                      "月线破线："
+                      + ", ".join(f"M{n}" for n in broken_lines_today)
+                      + f"，合计加仓 ${break_buy_total:,.0f}"
+                  )
+
+          if acute_drop_signal_today:
+              if ACUTE_DROP_BUY is None:
+                  execution_items.append(
+                      "10%急跌：首次触发，但急跌买入金额未配置，暂不输出可执行买入金额"
+                  )
+                  execution_safe = False
+              else:
+                  execution_items.append(
+                      f"10%急跌：首次触发，买入 ${float(ACUTE_DROP_BUY):,.0f}"
+                  )
+
+          if not execution_items:
+              execution_items.append("今日没有新的V5.6买入触发条件")
+
+          # 最终状态
+          if execution_safe and any([
+              is_first_trading_day_of_month,
+              monthly_break_signal_today and not missing_break_amounts,
+              acute_drop_signal_today and ACUTE_DROP_BUY is not None,
+          ]):
+              execution_conclusion = "存在可执行的V5.6买入事项，详见下方"
+          elif not execution_safe:
+              execution_conclusion = "⚠️ 检测到V5.6触发条件，但金额配置不完整，本次不得仅凭自动邮件下单"
+          else:
+              execution_conclusion = "今日不执行V5.6买入"
+
+          # ==========================================================
+          # 11. 最终邮件报告
+          # ==========================================================
           signal_lines = [
               f"检查交易日：{latest_date}",
               f"QQQM收盘：{latest_close:.2f}",
               f"最新完整月：{latest_month}",
+              "",
+              "V5.6执行结论：",
+              execution_conclusion,
+              "",
           ]
 
+          for item in execution_items:
+              signal_lines.append(f"- {item}")
+
+          signal_lines += [
+              "",
+              "月线破线状态：",
+          ]
           for n in [5, 10, 20, 30, 60]:
+              ma = float(latest_month_row[f"M{n}"])
+              gap = float(latest_month_row["Close"]) / ma - 1
+              state = "已破线" if line_breaks[n] else "未破线"
               signal_lines.append(
-                  f"M{n}: {'破线' if line_breaks[n] else '未破线'}"
+                  f"M{n}：{state}（均线 {ma:.2f}，收盘相对均线 {gap * 100:.2f}%）"
               )
 
-          if acute_drop_triggered:
+          signal_lines += [
+              "",
+              "10%急跌检查：",
+          ]
+
+          if not current_month_daily.empty:
+              signal_lines += [
+                  f"本月首个交易日开盘：{first_open:.2f}",
+                  f"10%触发价格：{threshold_price:.2f}",
+                  f"本交易日最低：{float(current_month_daily.iloc[-1]['low']):.2f}",
+              ]
+              if acute_drop_triggered:
+                  signal_lines.append(
+                      f"10%急跌：已触发，首次触发日 {acute_drop_date}，最低 {acute_drop_low:.2f}"
+                  )
+              else:
+                  signal_lines.append("10%急跌：未触发")
+
+          signal_lines += [
+              "",
+              "基础参数：",
+              f"基础月度定投：${BASE_MONTHLY_BUY:,.0f}",
+              "破线金额：",
+          ]
+          for n in [5, 10, 20, 30, 60]:
+              amount = BREAK_BUY_AMOUNTS[n]
               signal_lines.append(
-                  f"10%急跌：已触发（{acute_drop_date}，最低{acute_drop_low:.2f}）"
+                  f"M{n}：${float(amount):,.0f}" if amount is not None else f"M{n}：未配置"
+              )
+          signal_lines.append(
+              f"10%急跌买入：${float(ACUTE_DROP_BUY):,.0f}" if ACUTE_DROP_BUY is not None else "10%急跌买入：未配置"
+          )
+
+          signal_lines += [
+              "",
+              "均线数值：",
+          ]
+          for n in [5, 10, 20, 30, 60]:
+              ma_value = float(latest_month_row[f"M{n}"])
+              signal_lines.append(
+                  f"M{n}：{ma_value:.2f}"
+              )
+
+          signal_lines += [
+              "",
+              "数据来源：",
+          ]
+          if supplemental_source_used:
+              signal_lines.append(
+                  "Yahoo历史接口滞后，本次使用StockAnalysis历史数据补齐最新交易日。"
               )
           else:
-              signal_lines.append("10%急跌：未触发")
+              signal_lines.append(
+                  "Yahoo历史接口已取得最新完整交易日。"
+              )
 
-          if is_new_completed_month:
-              signal_lines.append("本次属于新月份首个完整交易日后的检查窗口")
+          signal_lines += [
+              "",
+              "监控纪律：",
+              "基础月度定投仅在每月第一个美股交易日进入执行资格。",
+              "月线破线仅在新月份首个完整交易日确认一次，避免重复报警。",
+              "10%急跌仅在首次跌破月初开盘价10%的交易日确认一次，避免重复报警。",
+              "金额配置缺失时，程序禁止给出可执行买入金额。",
+          ]
 
           report_body = "\n".join(signal_lines)
+          print(report_body)
 
-          report_body += "\n\n均线数值："
-          for n in [5, 10, 20, 30, 60]:
-              report_body += f"\nM{n}：{float(latest_month_row[f'M{n}']):.2f}"
-
-          report_body += "\n\n数据来源："
-          if supplemental_source_used:
-              report_body += "\nYahoo历史接口滞后，本次使用StockAnalysis历史数据补齐最新交易日。"
+          if not execution_safe:
+              subject = f"⚠️ QQQM V5.6：{latest_date}触发但需人工确认"
+          elif is_first_trading_day_of_month or monthly_break_signal_today or acute_drop_signal_today:
+              subject = f"⚠️ QQQM V5.6：{latest_date}有买入事项"
           else:
-              report_body += "\nYahoo历史接口已取得最新完整交易日。"
-
-          report_body += "\n\n当前版本说明："
-          report_body += "\n本邮件为QQQM行情与破线监控报告。正式V5.6各档买入金额尚未写入自动化，不应仅依据本邮件直接下单。"
-
-          print("\n".join(signal_lines))
-
-          # ==========================================================
-          # 11. 正常运行也发送监控结果邮件
-          # ==========================================================
-          if acute_drop_triggered or any(line_breaks.values()):
-              subject = f"⚠️ QQQM自动监控：{latest_date}检测到条件"
-          else:
-              subject = f"✅ QQQM自动监控：{latest_date}正常"
+              subject = f"✅ QQQM V5.6：{latest_date}无新买入信号"
 
           send_email(subject, report_body)
-          print("✅ 正常监控结果邮件发送成功")
-
+          print("✅ V5.6执行报告邮件发送成功")
           PY
