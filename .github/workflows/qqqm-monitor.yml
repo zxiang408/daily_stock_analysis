@@ -1,41 +1,48 @@
-name: QQQM急跌13% + TQQQ交易信号监控
+name: QQQM急跌 + TQQQ买卖点监控
 
 on:
-  # QQQM盘中急跌监控：GitHub Actions最短计划间隔为5分钟。
-  # Python内部只在NYSE正规交易时段运行。
+  # ------------------------------------------------------------
+  # QQQM盘中13%急跌：美东交易时段内约每5分钟检查一次
+  # ------------------------------------------------------------
   schedule:
     - cron: '*/5 9-15 * * 1-5'
       timezone: 'America/New_York'
 
-    # TQQQ每日收盘信号：收盘后留出20分钟给行情源更新。
-    - cron: '20 16 * * 1-5'
-      timezone: 'America/New_York'
+    # ----------------------------------------------------------
+    # 每天北京时间08:00：
+    # 1) TQQQ收盘买卖点检查
+    # 2) 若正好是下个月首个美国交易日的北京时间08:00，发送上月QQQM月线报告
+    # ----------------------------------------------------------
+    - cron: '0 8 * * *'
+      timezone: 'Asia/Shanghai'
 
   workflow_dispatch:
     inputs:
-      test_email:
-        description: '仅测试邮箱，不检查行情'
-        required: true
-        default: false
-        type: boolean
-      run_mode:
+      mode:
         description: '手动运行模式'
         required: true
-        default: all
+        default: 'daily_close'
         type: choice
         options:
-          - all
-          - qqqm
-          - tqqq
+          - daily_close
+          - qqqm_intraday
+          - test_email
 
 jobs:
-  # ================================================================
+  # ============================================================
   # 邮箱测试
-  # ================================================================
-  email-test:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_email == true }}
+  # ============================================================
+  email_test:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'test_email' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
+      - name: 安装Python依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas curl_cffi exchange_calendars
+
       - name: 测试QQ邮箱
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -56,40 +63,64 @@ jobs:
               receivers = [sender]
 
           msg = EmailMessage()
-          msg['Subject'] = 'QQQM/TQQQ自动监控：邮箱测试成功'
+          msg['Subject'] = 'QQQM + TQQQ自动监控：邮箱测试成功'
           msg['From'] = sender
           msg['To'] = ', '.join(receivers)
           msg.set_content(
-              'QQQM 13%盘中急跌 + TQQQ V2.0交易信号监控的邮件链路测试成功。\n\n'
-              '本次仅测试邮箱，不检查QQQM，也不检查TQQQ，不产生交易信号。'
+              'QQQM + TQQQ 自动监控邮件链路正常。\n\n'
+              '本次仅测试邮箱，不检查市场，也不会产生交易信号。'
           )
           with smtplib.SMTP_SSL('smtp.qq.com', 465, timeout=30) as server:
               server.login(sender, password)
               server.send_message(msg)
-          print('✅ 邮箱测试邮件发送成功')
+          print('✅ 邮箱测试成功')
           PY
 
-  # ================================================================
-  # QQQM：只监控盘中13%急跌，不发送每日常规报告
-  # ================================================================
-  qqqm-intraday:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_email == true) && (github.event_name != 'workflow_dispatch' || inputs.run_mode == 'all' || inputs.run_mode == 'qqqm') }}
+  # ============================================================
+  # QQQM：盘中13%急跌报警
+  # ============================================================
+  qqqm_intraday:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '*/5 9-15 * * 1-5')
+      ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'qqqm_intraday')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: qqqm-intraday-alert
+      cancel-in-progress: false
+
     steps:
-      - name: 安装依赖
+      - name: 安装Python依赖
         run: |
           python -m pip install --upgrade pip
           pip install pandas curl_cffi exchange_calendars
 
-      - name: QQQM盘中13%急跌监控
+      - name: 确定本月状态缓存键
+        id: state_key
+        run: |
+          echo "month=$(TZ=America/New_York date +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: 恢复本月QQQM急跌报警状态
+        id: restore_state
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor_state
+          key: qqqm-acute-${{ steps.state_key.outputs.month }}
+
+      - name: 检查QQQM盘中13%急跌
+        id: run_check
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
         run: |
           python <<'PY'
+          import json
           import os
           import smtplib
+          from datetime import datetime
           from email.message import EmailMessage
 
           import pandas as pd
@@ -97,8 +128,57 @@ jobs:
           from curl_cffi import requests
 
           TICKER = 'QQQM'
-          DROP = 0.13
-          NY_TZ = 'America/New_York'
+          THRESHOLD = 0.13
+          STATE_DIR = '.monitor_state'
+          STATE_FILE = os.path.join(STATE_DIR, 'qqqm_acute_alert.json')
+
+          # V5.6破线金额配置。必须填写你最终确认的五档金额；程序不会自行猜测。
+          BASE_MONTHLY_BUY = 800.0
+          BREAK_BUY_AMOUNTS = {
+              5: None,
+              10: None,
+              20: None,
+              30: None,
+              60: None,
+          }
+
+          def output(name, value):
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+                  f.write(f'{name}={value}\n')
+
+          output('triggered', 'false')
+
+          # 已经报警过：本月不重复报警
+          if os.path.exists(STATE_FILE):
+              try:
+                  with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                      state = json.load(f)
+                  if state.get('alerted'):
+                      print('✅ 本月QQQM 13%急跌已经报警过，不重复发送。')
+                      raise SystemExit(0)
+              except SystemExit:
+                  raise
+              except Exception:
+                  pass
+
+          now_utc = pd.Timestamp.now(tz='UTC')
+          et = 'America/New_York'
+          now_et = now_utc.tz_convert(et)
+          nyse = xcals.get_calendar('XNYS')
+
+          # 找到今天美股正式交易时段
+          today = now_et.strftime('%Y-%m-%d')
+          sched = nyse.schedule.loc[today:today]
+          if sched.empty:
+              print('今天不是NYSE交易日，退出。')
+              raise SystemExit(0)
+
+          session = sched.iloc[0]
+          market_open = pd.Timestamp(session['open'])
+          market_close = pd.Timestamp(session['close'])
+          if not (market_open <= now_utc <= market_close):
+              print('当前不在NYSE正规交易时段，退出。')
+              raise SystemExit(0)
 
           sender = os.environ.get('EMAIL_SENDER', '').strip()
           password = os.environ.get('EMAIL_PASSWORD', '').strip()
@@ -118,155 +198,241 @@ jobs:
                   server.login(sender, password)
                   server.send_message(msg)
 
-          now = pd.Timestamp.now(tz=NY_TZ)
-          nyse = xcals.get_calendar('XNYS')
+          def fetch_chart(interval, range_text, host):
+              url = f'https://{host}/v8/finance/chart/{TICKER}'
+              params = {
+                  'range': range_text,
+                  'interval': interval,
+                  'events': 'div,splits',
+                  'includeAdjustedClose': 'true',
+                  'includePrePost': 'false',
+              }
+              session = requests.Session(impersonate='chrome')
+              try:
+                  r = session.get(url, params=params, timeout=30)
+                  r.raise_for_status()
+                  payload = r.json()
+                  result = payload.get('chart', {}).get('result')
+                  if not result:
+                      raise RuntimeError('Yahoo返回结果为空')
+                  result = result[0]
+                  ts = result.get('timestamp', [])
+                  quote = result.get('indicators', {}).get('quote', [])
+                  if not ts or not quote:
+                      raise RuntimeError('Yahoo行情结构异常')
+                  q = quote[0]
+                  lows = q.get('low', [])
+                  opens = q.get('open', [])
+                  closes = q.get('close', [])
+                  if not (len(ts) == len(lows) == len(opens) == len(closes)):
+                      raise RuntimeError('时间与OHLC长度不一致')
+                  rows = []
+                  tz_name = result.get('meta', {}).get('exchangeTimezoneName', et)
+                  for t, o, lo, cl in zip(ts, opens, lows, closes):
+                      if cl is None:
+                          continue
+                      dt = pd.Timestamp(t, unit='s', tz='UTC').tz_convert(tz_name)
+                      rows.append({
+                          'timestamp': dt,
+                          'date': dt.strftime('%Y-%m-%d'),
+                          'open': float(o) if o is not None else float('nan'),
+                          'low': float(lo) if lo is not None else float('nan'),
+                          'close': float(cl),
+                      })
+                  return pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
+              finally:
+                  session.close()
 
-          # 找到今天是否为NYSE交易日，以及当前是否处于正规交易时段
-          today = now.strftime('%Y-%m-%d')
-          sched = nyse.schedule.loc[today:today]
-          if sched.empty:
-              print(f'今天 {today} 不是NYSE交易日，跳过QQQM盘中监控。')
-              raise SystemExit(0)
+          # 日线用于取得本月第一个NYSE交易日开盘价
+          daily = None
+          last_errors = []
+          for host in ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']:
+              try:
+                  d = fetch_chart('1d', '3mo', host)
+                  daily = d
+                  print(f'{host}日线读取成功，最新日期：{d.iloc[-1]["date"]}')
+                  break
+              except Exception as exc:
+                  last_errors.append(f'{host}: {exc}')
 
-          market_open = sched.iloc[0]['open' if 'open' in sched.columns else 'market_open']
-          market_close = sched.iloc[0]['close' if 'close' in sched.columns else 'market_close']
-          if not (market_open <= now.tz_convert('UTC') < market_close):
-              print(f'当前不在NYSE正规交易时段：{now}')
-              raise SystemExit(0)
+          if daily is None:
+              raise RuntimeError('无法取得QQQM日线数据：' + '；'.join(last_errors))
 
-          # 本月第一交易日
-          month_start = pd.Timestamp(today).to_period('M').start_time.strftime('%Y-%m-%d')
-          sessions = nyse.sessions_in_range(month_start, today)
-          if len(sessions) == 0:
-              raise RuntimeError('无法取得本月NYSE交易日')
-          first_session = sessions[0]
-          first_date = first_session.strftime('%Y-%m-%d')
+          current_month = now_et.strftime('%Y-%m')
+          month_rows = daily[daily['date'].str.startswith(current_month)].copy()
+          if month_rows.empty:
+              raise RuntimeError('当前月份尚未取得QQQM日线数据')
+          month_open = float(month_rows.iloc[0]['open'])
+          trigger_price = month_open * (1 - THRESHOLD)
 
-          def yahoo_chart(period1, period2, interval='5m'):
-              # query1/query2依次尝试；5分钟级数据只用于盘中预警，不用于收盘正式交易信号。
+          # 当前价格提示所使用的月线：只用上一个完整月份及以前的数据。
+          def fetch_daily_history():
               errors = []
               for host in ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']:
                   url = f'https://{host}/v8/finance/chart/{TICKER}'
                   params = {
-                      'period1': int((pd.Timestamp(period1).tz_convert('UTC') if pd.Timestamp(period1).tzinfo else pd.Timestamp(period1).tz_localize('UTC')).timestamp()),
-                      'period2': int((pd.Timestamp(period2).tz_convert('UTC') if pd.Timestamp(period2).tzinfo else pd.Timestamp(period2).tz_localize('UTC')).timestamp()),
-                      'interval': interval,
+                      'range': '15y',
+                      'interval': '1d',
                       'events': 'div,splits',
                       'includeAdjustedClose': 'true',
+                      'includePrePost': 'false',
                   }
                   session = requests.Session(impersonate='chrome')
                   try:
-                      resp = session.get(url, params=params, timeout=25)
-                      resp.raise_for_status()
-                      result = resp.json().get('chart', {}).get('result')
+                      r = session.get(url, params=params, timeout=25)
+                      r.raise_for_status()
+                      result = r.json().get('chart', {}).get('result')
                       if not result:
-                          raise RuntimeError('Yahoo返回结果为空')
+                          raise RuntimeError('Yahoo历史返回为空')
                       result = result[0]
                       ts = result.get('timestamp', [])
-                      quote = result.get('indicators', {}).get('quote', [{}])[0]
-                      close = quote.get('close', [])
-                      low = quote.get('low', [])
-                      opn = quote.get('open', [])
-                      if not ts or len({len(ts), len(close), len(low), len(opn)}) != 1:
-                          raise RuntimeError('Yahoo盘中数据结构异常')
-                      tzname = result.get('meta', {}).get('exchangeTimezoneName', NY_TZ)
+                      q = result.get('indicators', {}).get('quote', [{}])[0]
+                      op = q.get('open', [])
+                      cl = q.get('close', [])
+                      if not ts or len(ts) != len(op) or len(ts) != len(cl):
+                          raise RuntimeError('Yahoo历史日线结构异常')
+                      tzname = result.get('meta', {}).get('exchangeTimezoneName', et)
                       rows = []
-                      for t, o, c, lo in zip(ts, opn, close, low):
+                      for t, o, c in zip(ts, op, cl):
                           if c is None:
                               continue
                           dt = pd.Timestamp(t, unit='s', tz='UTC').tz_convert(tzname)
-                          rows.append({'timestamp': dt, 'date': dt.strftime('%Y-%m-%d'), 'open': float(o) if o is not None else float('nan'), 'close': float(c), 'low': float(lo) if lo is not None else float('nan')})
-                      df = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
+                          rows.append({
+                              'date': dt.strftime('%Y-%m-%d'),
+                              'open': float(o) if o is not None else float('nan'),
+                              'close': float(c),
+                          })
+                      df = pd.DataFrame(rows).drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
                       if df.empty:
-                          raise RuntimeError('Yahoo没有有效盘中数据')
+                          raise RuntimeError('Yahoo历史没有有效数据')
                       return df
                   except Exception as exc:
                       errors.append(f'{host}: {exc}')
                   finally:
                       session.close()
-              raise RuntimeError('；'.join(errors))
+              raise RuntimeError('QQQM历史月线数据获取失败：' + '；'.join(errors))
 
-          # 获取本月第一交易日到当前的5分钟数据。
-          start = pd.Timestamp(f'{first_date} 09:25:00', tz=NY_TZ)
-          end = now + pd.Timedelta(minutes=1)
-          intraday = yahoo_chart(start.isoformat(), end.isoformat(), interval='5m')
-          intraday = intraday[intraday['timestamp'].dt.tz_convert(NY_TZ).dt.date <= now.date()].copy()
+          history = fetch_daily_history()
+          history['month'] = pd.to_datetime(history['date']).dt.to_period('M')
+          monthly_close = history.groupby('month')['close'].last().sort_index()
+          latest_complete_month = pd.Period(current_month, freq='M') - 1
+          monthly_close = monthly_close[monthly_close.index <= latest_complete_month]
+          if len(monthly_close) < 60:
+              raise RuntimeError('QQQM完整月线不足60个月，无法计算M5/M10/M20/M30/M60。')
 
-          # 只保留当前月第一交易日的正规时段，用于确定月初开盘价。
-          first_day_bars = intraday[intraday['date'] == first_date].copy()
-          first_day_bars = first_day_bars[
-              (first_day_bars['timestamp'].dt.hour * 60 + first_day_bars['timestamp'].dt.minute >= 570) &
-              (first_day_bars['timestamp'].dt.hour * 60 + first_day_bars['timestamp'].dt.minute < 960)
-          ]
-          if first_day_bars.empty:
-              raise RuntimeError('无法取得本月第一交易日盘中数据，因此无法确认13%急跌基准。')
+          monthly_ma = {n: float(monthly_close.tail(n).mean()) for n in [5, 10, 20, 30, 60]}
 
-          first_open = float(first_day_bars.iloc[0]['open'])
-          threshold = first_open * (1 - DROP)
-
-          # 当前交易时段的数据只保留09:30之后；取最近两根5分钟K线。
-          today_bars = intraday[intraday['date'] == today].copy()
-          today_bars = today_bars[
-              (today_bars['timestamp'].dt.hour * 60 + today_bars['timestamp'].dt.minute >= 570) &
-              (today_bars['timestamp'].dt.hour * 60 + today_bars['timestamp'].dt.minute < 960)
-          ]
-          if today_bars.empty:
-              print('暂无今天盘中数据。')
-              raise SystemExit(0)
-
-          latest = today_bars.iloc[-1]
-          previous = today_bars.iloc[-2] if len(today_bars) >= 2 else None
-
-          crossed = False
-          if float(latest['low']) <= threshold:
-              if previous is None or float(previous['close']) > threshold:
-                  crossed = True
+          def broken_month_lines(price):
+              return [n for n in [5, 10, 20, 30, 60] if price < monthly_ma[n]]
 
           print('==========================================')
           print('QQQM盘中13%急跌监控')
           print('==========================================')
-          print(f'时间：{now.strftime("%Y-%m-%d %H:%M:%S %Z")}')
-          print(f'本月首个交易日：{first_date}')
-          print(f'本月首个交易日开盘：{first_open:.2f}')
-          print(f'13%急跌触发价：{threshold:.2f}')
-          print(f'最新盘中价：{float(latest["close"]):.2f}')
-          print(f'最近5分钟最低：{float(latest["low"]):.2f}')
-          print(f'本次是否首次向下穿越：{"是" if crossed else "否"}')
+          print(f'美国东部时间：{now_et.strftime("%Y-%m-%d %H:%M:%S %Z")}')
+          print(f'本月首个交易日开盘：{month_open:.2f}')
+          print(f'13%触发价格：{trigger_price:.2f}')
 
-          if crossed:
-              body = (
-                  '⚠️ QQQM盘中13%急跌触发\n\n'
-                  f'时间：{now.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
-                  f'本月首个交易日：{first_date}\n'
-                  f'本月首个交易日开盘：{first_open:.2f}\n'
-                  f'13%触发价格：{threshold:.2f}\n'
-                  f'当前盘中价格：{float(latest["close"]):.2f}\n'
-                  f'最近5分钟最低：{float(latest["low"]):.2f}\n\n'
-                  '已触发QQQM V5.6盘中13%急跌条件。\n'
-                  '这是盘中预警，不代表月线破线确认。请按你已经确定的V5.6急跌纪律处理。'
+          intraday = None
+          last_errors = []
+          for host in ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']:
+              try:
+                  d = fetch_chart('1m', '1d', host)
+                  intraday = d
+                  print(f'{host} 1分钟数据读取成功')
+                  break
+              except Exception as exc:
+                  last_errors.append(f'{host}: {exc}')
+
+          if intraday is None:
+              raise RuntimeError('无法取得QQQM盘中1分钟数据：' + '；'.join(last_errors))
+
+          today_rows = intraday[intraday['date'] == today].copy()
+          if today_rows.empty:
+              print('当前暂无今日正规时段1分钟数据，退出。')
+              raise SystemExit(0)
+
+          touched = today_rows[today_rows['low'] <= trigger_price].copy()
+          if touched.empty:
+              latest = today_rows.iloc[-1]
+              print(f'最新1分钟收盘：{latest["close"]:.2f}，尚未触发13%急跌。')
+              raise SystemExit(0)
+
+          first_touch = touched.iloc[0]
+          first_touch_time = pd.Timestamp(first_touch['timestamp'])
+          first_touch_low = float(first_touch['low'])
+          latest = today_rows.iloc[-1]
+          latest_price = float(latest['close'])
+          broken_lines = broken_month_lines(latest_price)
+          broken_text = '、'.join(f'M{n}' for n in broken_lines) if broken_lines else '无'
+          if broken_lines:
+              deepest = max(broken_lines)
+              configured_amount = BREAK_BUY_AMOUNTS.get(deepest)
+              rule_buy_text = (
+                  f'最深破线M{deepest}；按V5.6该档应买入${configured_amount:,.0f}'
+                  if configured_amount is not None
+                  else f'最深破线M{deepest}；M{deepest}对应买入金额尚未配置'
               )
-              send_email('⚠️ QQQM V5.6：盘中13%急跌触发', body)
-              print('✅ 急跌预警邮件已发送')
           else:
-              print('🟢 本次没有新的13%急跌触发，不发送常规邮件。')
+              rule_buy_text = '当前价未跌破M5/M10/M20/M30/M60'
+
+          body = (
+              'QQQM V5.6 盘中13%急跌报警\n\n'
+              f'美国东部时间：{first_touch_time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n'
+              f'本月首个交易日开盘：${month_open:.2f}\n'
+              f'13%触发价格：${trigger_price:.2f}\n'
+              f'首次触发分钟最低价：${first_touch_low:.2f}\n'
+              f'当前最近价格：${latest_price:.2f}\n'
+              f'当前价格已跌破月线：{broken_text}\n'
+              f'按V5.6破线纪律：{rule_buy_text}\n\n'
+              '定义：相对当月第一个美股交易日正规交易时段开盘价下跌13%。\n'
+              '本月已触发，本程序本月不重复报警。\n\n'
+              '请按你的QQQM V5.6纪律处理；本邮件仅负责提醒，不自动下单。'
+          )
+
+          send_email('⚠️ QQQM V5.6：盘中13%急跌触发', body)
+
+          os.makedirs(STATE_DIR, exist_ok=True)
+          with open(STATE_FILE, 'w', encoding='utf-8') as f:
+              json.dump({
+                  'alerted': True,
+                  'month': current_month,
+                  'trigger_time': first_touch_time.isoformat(),
+                  'trigger_price': trigger_price,
+              }, f, ensure_ascii=False, indent=2)
+
+          output('triggered', 'true')
+          print('✅ QQQM 13%急跌报警邮件已发送。')
           PY
 
-  # ================================================================
-  # TQQQ：V2.0只在出现买/卖信号时发邮件
-  # ================================================================
-  tqqq-close:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_email == true) && (github.event_name != 'workflow_dispatch' || inputs.run_mode == 'all' || inputs.run_mode == 'tqqq') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: 获取仓库文件
-        uses: actions/checkout@v4
+      - name: 保存本月QQQM急跌报警状态
+        if: ${{ steps.run_check.outputs.triggered == 'true' && steps.restore_state.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor_state
+          key: qqqm-acute-${{ steps.state_key.outputs.month }}
 
-      - name: 安装依赖
+  # ============================================================
+  # TQQQ：每日收盘买卖点 + QQQM月度报告
+  # ============================================================
+  daily_close:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 8 * * *')
+      ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily_close')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: daily-close-monitor
+      cancel-in-progress: false
+
+    steps:
+      - name: 安装Python依赖
         run: |
           python -m pip install --upgrade pip
           pip install pandas curl_cffi exchange_calendars
 
-      - name: TQQQ V2.0收盘信号检查
+      - name: TQQQ收盘买卖点 + QQQM月度报告
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -282,17 +448,8 @@ jobs:
           import exchange_calendars as xcals
           from curl_cffi import requests
 
-          TICKER = 'TQQQ'
           YAHOO_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
           PRICE_DIFF_LIMIT = 0.002
-          NY_TZ = 'America/New_York'
-          TRADES_FILE = 'tqqq_trades.csv'
-
-          BUY_LEVELS = [0.00, -0.10, -0.20, -0.30, -0.40]
-          SELL_D60_LEVELS = [0.50, 1.00, 1.50, 2.00, 2.50]
-          SELL_TARGETS = [0.20, 0.40, 0.60, 0.80, 1.00]
-          UNIT_USD = 2000.0
-          MAX_USD = 10000.0
 
           sender = os.environ.get('EMAIL_SENDER', '').strip()
           password = os.environ.get('EMAIL_PASSWORD', '').strip()
@@ -312,336 +469,383 @@ jobs:
                   server.login(sender, password)
                   server.send_message(msg)
 
+          now_utc = pd.Timestamp.now(tz='UTC')
+          now_bj = now_utc.tz_convert('Asia/Shanghai')
+          now_et = now_utc.tz_convert('America/New_York')
           nyse = xcals.get_calendar('XNYS')
-          now = pd.Timestamp.now(tz=NY_TZ)
-          today = now.strftime('%Y-%m-%d')
 
-          sched = nyse.schedule.loc[(now - pd.Timedelta(days=10)).strftime('%Y-%m-%d'):today]
-          if sched.empty:
-              print('无法取得NYSE交易日历。')
-              raise SystemExit(0)
-          completed = sched[sched['close' if 'close' in sched.columns else 'market_close'] <= now.tz_convert('UTC')]
+          # ----------------------------------------------------------
+          # 市场日历：最近完整交易日 + 上一交易日 + 下一交易日
+          # ----------------------------------------------------------
+          start_date = (now_utc - pd.Timedelta(days=20)).strftime('%Y-%m-%d')
+          end_date = (now_utc + pd.Timedelta(days=20)).strftime('%Y-%m-%d')
+          schedule = nyse.schedule.loc[start_date:end_date]
+          if schedule.empty:
+              raise RuntimeError('无法取得NYSE交易日历')
+
+          close_col = 'close' if 'close' in schedule.columns else 'market_close'
+          completed = schedule[schedule[close_col] <= now_utc]
           if completed.empty:
-              print('当前没有已完成NYSE交易日。')
-              raise SystemExit(0)
-          expected_session = completed.index[-1]
-          expected_date = expected_session.strftime('%Y-%m-%d')
-          previous_session = completed.index[-2] if len(completed) >= 2 else None
-          previous_date = previous_session.strftime('%Y-%m-%d') if previous_session is not None else None
+              raise RuntimeError('没有完整NYSE交易日')
 
-          def fetch_yahoo_daily(host):
-              url = f'https://{host}/v8/finance/chart/{TICKER}'
-              p1 = pd.Timestamp('2010-01-01', tz='UTC')
-              p2 = now.tz_convert('UTC') + pd.Timedelta(days=1)
-              params = {
-                  'period1': int(p1.timestamp()),
-                  'period2': int(p2.timestamp()),
-                  'interval': '1d',
-                  'events': 'div,splits',
-                  'includeAdjustedClose': 'true',
-              }
-              session = requests.Session(impersonate='chrome')
-              try:
-                  r = session.get(url, params=params, timeout=30)
-                  r.raise_for_status()
-                  result = r.json().get('chart', {}).get('result')
-                  if not result:
-                      raise RuntimeError('Yahoo返回结果为空')
-                  result = result[0]
-                  ts = result.get('timestamp', [])
-                  q = result.get('indicators', {}).get('quote', [{}])[0]
-                  op, hi, lo, cl = q.get('open', []), q.get('high', []), q.get('low', []), q.get('close', [])
-                  if not ts or len({len(ts), len(op), len(hi), len(lo), len(cl)}) != 1:
-                      raise RuntimeError('Yahoo日线结构异常')
-                  tzname = result.get('meta', {}).get('exchangeTimezoneName', NY_TZ)
-                  rows = []
-                  for t, o, h, l, c in zip(ts, op, hi, lo, cl):
-                      if c is None:
-                          continue
-                      dt = pd.Timestamp(t, unit='s', tz='UTC').tz_convert(tzname)
-                      rows.append({'date': dt.strftime('%Y-%m-%d'), 'open': float(o) if o is not None else float('nan'), 'high': float(h) if h is not None else float('nan'), 'low': float(l) if l is not None else float('nan'), 'close': float(c)})
-                  df = pd.DataFrame(rows).drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
-                  if df.empty:
-                      raise RuntimeError('Yahoo没有有效TQQQ日线')
-                  return df
-              finally:
-                  session.close()
+          latest_session = completed.index[-1]
+          latest_date = latest_session.strftime('%Y-%m-%d')
+          prev_session = completed.index[-2] if len(completed) >= 2 else None
+          prev_date = prev_session.strftime('%Y-%m-%d') if prev_session is not None else None
 
-          sources = {}
-          errors = []
-          for host in YAHOO_HOSTS:
-              try:
-                  d = fetch_yahoo_daily(host)
-                  d = d[d['date'] <= expected_date].copy()
-                  if d.empty:
-                      raise RuntimeError('无有效数据')
-                  sources[host] = d
-                  print(f'{host} 最新：{d.iloc[-1]["date"]} / {d.iloc[-1]["close"]:.4f}')
-              except Exception as exc:
-                  errors.append(f'{host}: {exc}')
+          future_sessions = schedule[schedule.index > latest_session]
+          next_session = future_sessions.index[0] if not future_sessions.empty else None
+          next_date = next_session.strftime('%Y-%m-%d') if next_session is not None else None
 
-          if not sources:
-              raise RuntimeError('两个Yahoo入口均无法获取TQQQ数据；' + '；'.join(errors))
+          print('==========================================')
+          print('QQQM + TQQQ 每日收盘监控')
+          print('==========================================')
+          print(f'北京时间：{now_bj.strftime("%Y-%m-%d %H:%M:%S %Z")}')
+          print(f'最新完整NYSE交易日：{latest_date}')
+          print(f'上一交易日：{prev_date}')
+          print(f'下一NYSE交易日：{next_date}')
 
-          yahoo_latest = max(d.iloc[-1]['date'] for d in sources.values())
+          def fetch_history(ticker, range_text='15y'):
+              errors = []
+              good = []
+              for host in YAHOO_HOSTS:
+                  try:
+                      url = f'https://{host}/v8/finance/chart/{ticker}'
+                      params = {
+                          'range': range_text,
+                          'interval': '1d',
+                          'events': 'div,splits',
+                          'includeAdjustedClose': 'true',
+                          'includePrePost': 'false',
+                      }
+                      session = requests.Session(impersonate='chrome')
+                      try:
+                          response = session.get(url, params=params, timeout=30)
+                          response.raise_for_status()
+                          payload = response.json()
+                      finally:
+                          session.close()
 
-          # StockAnalysis只作为“Yahoo最新日线滞后”的补充，不依赖其完整历史表格。
-          supplemental_used = False
-          supplemental_close = None
-          if yahoo_latest < expected_date:
-              url = 'https://stockanalysis.com/etf/tqqq/history/'
-              session = requests.Session(impersonate='chrome')
-              try:
-                  resp = session.get(url, timeout=30)
-                  resp.raise_for_status()
-                  html = resp.text
-                  num = r'-?(?:\d+(?:\.\d+)?|\.\d+)'
-                  pattern = re.compile(rf'\{{a:(?P<a>{num}),c:(?P<c>{num}),h:(?P<h>{num}),l:(?P<l>{num}),o:(?P<o>{num}),t:"(?P<t>\d{{4}}-\d{{2}}-\d{{2}})"')
-                  matches = list(pattern.finditer(html))
-                  if not matches:
-                      raise RuntimeError('StockAnalysis页面未找到内嵌TQQQ历史数据')
-                  rows = [{'date': m.group('t'), 'open': float(m.group('o')), 'high': float(m.group('h')), 'low': float(m.group('l')), 'close': float(m.group('c'))} for m in matches]
-                  sup = pd.DataFrame(rows).drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
-                  sup = sup[sup['date'] <= expected_date]
-                  latest = sup.iloc[-1]
-                  if latest['date'] != expected_date:
-                      raise RuntimeError(f'StockAnalysis也未更新到{expected_date}')
-                  supplemental_close = float(latest['close'])
-                  supplemental_used = True
-                  print(f'StockAnalysis补齐：{expected_date} / {supplemental_close:.4f}')
-              finally:
-                  session.close()
+                      result = payload.get('chart', {}).get('result')
+                      if not result:
+                          raise RuntimeError('Yahoo返回结果为空')
+                      result = result[0]
+                      ts = result.get('timestamp', [])
+                      quote = result.get('indicators', {}).get('quote', [])
+                      if not ts or not quote:
+                          raise RuntimeError('Yahoo数据结构异常')
+                      q = quote[0]
+                      op = q.get('open', [])
+                      hi = q.get('high', [])
+                      lo = q.get('low', [])
+                      cl = q.get('close', [])
+                      if not (len(ts) == len(op) == len(hi) == len(lo) == len(cl)):
+                          raise RuntimeError('时间与OHLC长度不一致')
+                      tz_name = result.get('meta', {}).get('exchangeTimezoneName', 'America/New_York')
+                      rows = []
+                      for t, o, h, l, c in zip(ts, op, hi, lo, cl):
+                          if c is None:
+                              continue
+                          dt = pd.Timestamp(t, unit='s', tz='UTC').tz_convert(tz_name)
+                          rows.append({
+                              'timestamp': dt,
+                              'date': dt.strftime('%Y-%m-%d'),
+                              'open': float(o) if o is not None else float('nan'),
+                              'high': float(h) if h is not None else float('nan'),
+                              'low': float(l) if l is not None else float('nan'),
+                              'close': float(c),
+                          })
+                      df = pd.DataFrame(rows).drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
+                      good.append((host, df))
+                  except Exception as exc:
+                      errors.append(f'{host}: {exc}')
 
-          # 选择历史数据：以一个Yahoo完整历史为基础；如果Yahoo缺少当天，则只插入补充的当天记录。
-          daily = max(sources.values(), key=lambda d: len(d)).copy()
-          if supplemental_used:
-              daily = pd.concat([
-                  daily,
-                  pd.DataFrame([{'date': expected_date, 'open': float('nan'), 'high': float('nan'), 'low': float('nan'), 'close': supplemental_close}])
-              ], ignore_index=True)
-              daily = daily.drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
+              if not good:
+                  raise RuntimeError(f'{ticker} Yahoo两个入口均失败：' + '；'.join(errors))
 
-          current_row = daily[daily['date'] == expected_date]
-          if current_row.empty:
-              raise RuntimeError(f'无法取得{expected_date}的TQQQ正式收盘')
-          current_close = float(current_row.iloc[-1]['close'])
+              # 如果两个入口都提供了最新完整交易日，交叉校验收盘
+              latest_rows = []
+              for host, df in good:
+                  x = df[df['date'] <= latest_date]
+                  if not x.empty:
+                      latest_rows.append((host, x.iloc[-1]))
 
-          # 如果两个Yahoo入口都已更新到当天，做最新收盘交叉校验。
-          fresh_yahoo = []
-          for host, d in sources.items():
-              row = d[d['date'] == expected_date]
-              if not row.empty:
-                  fresh_yahoo.append(float(row.iloc[-1]['close']))
-          if len(fresh_yahoo) >= 2:
-              diff = abs(fresh_yahoo[0] - fresh_yahoo[1]) / fresh_yahoo[0]
-              print(f'Yahoo双源当天收盘差异：{diff * 100:.4f}%')
-              if diff > PRICE_DIFF_LIMIT:
-                  send_email(
-                      '⚠️ TQQQ监控：行情源冲突',
-                      f'交易日：{expected_date}\nYahoo两个入口收盘差异：{diff * 100:.4f}%\n本次不产生TQQQ交易信号。'
+              if len(latest_rows) >= 2 and all(row['date'] == latest_date for _, row in latest_rows[:2]):
+                  p1 = float(latest_rows[0][1]['close'])
+                  p2 = float(latest_rows[1][1]['close'])
+                  diff = abs(p1 - p2) / p1
+                  if diff > PRICE_DIFF_LIMIT:
+                      raise RuntimeError(f'{ticker} Yahoo双源最新收盘差异过大：{diff*100:.4f}%')
+
+              # 选择最新日期最新的一份
+              good.sort(key=lambda item: item[1].iloc[-1]['date'], reverse=True)
+              selected_host, selected_df = good[0]
+              selected_df = selected_df[selected_df['date'] <= latest_date].copy()
+              return selected_host, selected_df
+
+          # ----------------------------------------------------------
+          # 1. TQQQ V2.0 收盘信号
+          # ----------------------------------------------------------
+          tqqq_host, tqqq = fetch_history('TQQQ', '15y')
+          if tqqq.iloc[-1]['date'] != latest_date:
+              send_email(
+                  '⚠️ TQQQ监控：行情数据未更新',
+                  (
+                      f'北京时间：{now_bj.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                      f'最近完整NYSE交易日：{latest_date}\n'
+                      f'TQQQ Yahoo最新数据：{tqqq.iloc[-1]["date"]}\n\n'
+                      '本次无法可靠计算正式D60交易信号，因此不产生交易指令。'
                   )
-                  raise RuntimeError('Yahoo双源价格冲突')
-
-          # ------------------------------------------------------------
-          # 构造月末收盘，并计算“每个月适用的M60”
-          # M60(month) = 该月开始前最近60个完整月的月末Close平均值。
-          # 因此当前月的M60天然不包含当前月，符合V2.0。
-          # ------------------------------------------------------------
-          daily['month'] = pd.to_datetime(daily['date']).dt.to_period('M')
-          monthly_close = daily.groupby('month')['close'].last().sort_index()
-          m60_by_month = monthly_close.rolling(60).mean().shift(1)
-
-          def month_m60(month):
-              val = m60_by_month.get(month)
-              if val is None or pd.isna(val):
-                  return None
-              return float(val)
-
-          current_month = pd.Period(expected_date, freq='M')
-          m60 = month_m60(current_month)
-          if m60 is None:
-              raise RuntimeError(f'{current_month}之前完整月线不足60个月，无法计算M60')
-          d60 = current_close / m60 - 1
-
-          # ------------------------------------------------------------
-          # 读取交易记录
-          # 文件格式：date,action,shares,price
-          # 例如：2026-01-15,buy,100,42.50
-          # 买入/卖出均按“上一交易日收盘信号、下一交易日执行”回溯对应档位。
-          # ------------------------------------------------------------
-          if not os.path.exists(TRADES_FILE):
-              print('ℹ️ 未发现tqqq_trades.csv，因此本次只做行情/D60检查，不输出可执行TQQQ信号。')
-              print('请将你的真实历史交易记录放入仓库根目录的tqqq_trades.csv。')
-              raise SystemExit(0)
-
-          trades = pd.read_csv(TRADES_FILE)
-          needed = {'date', 'action', 'shares', 'price'}
-          if not needed.issubset(trades.columns):
-              raise RuntimeError('tqqq_trades.csv必须包含：date, action, shares, price')
-          if trades.empty:
-              print('ℹ️ tqqq_trades.csv为空。本次不输出可执行TQQQ信号。')
-              raise SystemExit(0)
-
-          trades['date'] = pd.to_datetime(trades['date'], errors='coerce').dt.strftime('%Y-%m-%d')
-          trades['action'] = trades['action'].astype(str).str.strip().str.lower()
-          trades['shares'] = pd.to_numeric(trades['shares'], errors='coerce')
-          trades['price'] = pd.to_numeric(trades['price'], errors='coerce')
-          action_map = {'买入':'buy', '买':'buy', 'b':'buy', 'buy':'buy', '卖出':'sell', '卖':'sell', 's':'sell', 'sell':'sell'}
-          trades['action'] = trades['action'].map(lambda x: action_map.get(x, x))
-          if trades[['date','action','shares','price']].isna().any().any():
-              raise RuntimeError('tqqq_trades.csv存在无效日期/数量/价格')
-          if (~trades['action'].isin(['buy','sell'])).any():
-              raise RuntimeError('tqqq_trades.csv action只能是buy/sell或买入/卖出')
-          trades = trades.sort_values('date').reset_index(drop=True)
-
-          trading_dates = sorted(daily['date'].unique())
-          prev_map = {trading_dates[i]: trading_dates[i-1] for i in range(1, len(trading_dates))}
-          d60_series = {}
-          for _, row in daily.iterrows():
-              dt = row['date']
-              mm = month_m60(pd.Period(dt, freq='M'))
-              if mm is not None:
-                  d60_series[dt] = float(row['close']) / mm - 1
-
-          # 根据实际交易记录恢复本轮状态。
-          holdings = 0.0
-          buy_done = set()
-          sell_phase = False
-          sell_basis = None
-          cumulative_sold_shares = 0.0
-          round_no = 1
-          reconstruction_warnings = []
-
-          def highest_buy_level(d):
-              hits = [x for x in BUY_LEVELS if d <= x]
-              return max(hits) if hits else None
-
-          def highest_sell_target(d):
-              hits = [t for t in SELL_D60_LEVELS if d >= t]
-              return max(hits) if hits else None
-
-          for _, tr in trades.iterrows():
-              execution_date = tr['date']
-              shares = float(tr['shares'])
-              if shares <= 0:
-                  raise RuntimeError(f'{execution_date} 股数必须大于0')
-              signal_date = prev_map.get(execution_date)
-              if signal_date is None or signal_date not in d60_series:
-                  reconstruction_warnings.append(f'{execution_date}: 无法找到对应的上一交易日D60')
-                  signal_d60 = None
-              else:
-                  signal_d60 = d60_series[signal_date]
-
-              if tr['action'] == 'buy':
-                  if sell_phase:
-                      reconstruction_warnings.append(f'{execution_date}: 卖出阶段之后又出现买入记录，违反V2.0')
-                  if signal_d60 is not None:
-                      level = highest_buy_level(signal_d60)
-                      if level is not None:
-                          buy_done.add(level)
-                      else:
-                          reconstruction_warnings.append(f'{execution_date}: 买入记录对应日D60={signal_d60*100:.2f}%，未命中买档')
-                  holdings += shares
-
-              else:
-                  if signal_d60 is None or signal_d60 < 0.50:
-                      reconstruction_warnings.append(f'{execution_date}: 卖出记录对应日未达到+50%卖出启动条件')
-                  else:
-                      sell_phase = True
-                      if sell_basis is None:
-                          sell_basis = holdings
-                      if sell_basis <= 0:
-                          reconstruction_warnings.append(f'{execution_date}: 首次卖出时无正持仓，无法建立卖出基准')
-                  holdings -= shares
-                  cumulative_sold_shares += shares
-                  if holdings < -1e-9:
-                      raise RuntimeError(f'{execution_date}: 卖出超过实际持仓')
-                  holdings = max(0.0, holdings)
-
-                  if signal_d60 is not None and signal_d60 >= 2.50 and holdings <= 1e-9:
-                      # +250%目标完成且已实际清仓，本轮结束。
-                      round_no += 1
-                      buy_done = set()
-                      sell_phase = False
-                      sell_basis = None
-                      cumulative_sold_shares = 0.0
-
-          # 当前状态
-          invested_units = len(buy_done)
-          unused_dedicated_cash = max(0.0, MAX_USD - invested_units * UNIT_USD) if not sell_phase else max(0.0, MAX_USD - invested_units * UNIT_USD)
-
-          # 当前信号：以今日收盘D60判断，下一交易日执行。
-          action = 'none'
-          action_text = ''
-          next_trade = '不操作'
-
-          if not sell_phase:
-              if d60 <= 0:
-                  candidate_levels = [x for x in BUY_LEVELS if d60 <= x and x not in buy_done]
-                  if candidate_levels:
-                      level = max(candidate_levels)
-                      action = 'buy'
-                      action_text = f'D60 = {d60*100:.2f}%，达到{level*100:.0f}%买入档。'
-                      next_trade = f'下一交易日买入${UNIT_USD:,.0f} TQQQ（{level*100:.0f}%档）'
-          else:
-              if d60 >= 0.50 and holdings > 0:
-                  if sell_basis is None:
-                      basis = holdings
-                      prior_sold_pct = 0.0
-                  else:
-                      basis = sell_basis
-                      prior_sold_pct = cumulative_sold_shares / basis if basis else 0.0
-                  target_hits = [t for t in SELL_TARGETS if d60 >= SELL_D60_LEVELS[SELL_TARGETS.index(t)]]
-                  target = max(target_hits) if target_hits else None
-                  if target is not None:
-                      if target > prior_sold_pct + 1e-9:
-                          additional_pct = target - prior_sold_pct
-                          shares_to_sell = min(holdings, max(0, int(round(basis * additional_pct))))
-                          if shares_to_sell > 0:
-                              action = 'sell'
-                              action_text = f'D60 = {d60*100:.2f}%，达到D60 +{d60*100:.2f}%对应的累计卖出目标{target*100:.0f}%。'
-                              next_trade = f'下一交易日卖出 {shares_to_sell} 股 TQQQ'
-                          else:
-                              action_text = f'D60达到累计卖出目标{target*100:.0f}%，按整股计算本次应卖数量为0。'
-
-          print('==========================================')
-          print('TQQQ V2.0收盘检查')
-          print('==========================================')
-          print(f'数据日期：{expected_date}')
-          print(f'TQQQ正式收盘：{current_close:.4f}')
-          print(f'适用M60：{m60:.4f}')
-          print(f'D60：{d60*100:.2f}%')
-          print(f'当前实际持仓：{holdings:.0f}股')
-          print(f'已执行买入档位：{sorted([int(x*100) for x in buy_done], reverse=True) if buy_done else "无"}')
-          print(f'本轮状态：{"卖出阶段" if sell_phase else "买入/持有阶段"}')
-          print(f'本轮预计剩余未投入专用资金：${unused_dedicated_cash:,.0f}')
-          if reconstruction_warnings:
-              print('⚠️ 交易记录恢复警告：')
-              for w in reconstruction_warnings:
-                  print(' - ' + w)
-
-          # 无信号不发常规邮件；有信号才通知。
-          if action in ('buy', 'sell'):
-              body = (
-                  'TQQQ V2.0交易信号\n\n'
-                  f'数据日期：{expected_date}\n'
-                  f'TQQQ正式收盘：${current_close:.4f}\n'
-                  f'适用M60：${m60:.4f}\n'
-                  f'D60：{d60*100:.2f}%\n\n'
-                  f'当前实际持仓：{holdings:.0f}股\n'
-                  f'已执行买入档位：{sorted([int(x*100) for x in buy_done], reverse=True) if buy_done else "无"}\n'
-                  f'本轮状态：{"卖出阶段" if sell_phase else "买入/持有阶段"}\n\n'
-                  f'信号：{action_text}\n\n'
-                  f'下一交易日：{next_trade}\n'
               )
-              if sell_basis is not None:
-                  basis_pct = cumulative_sold_shares / sell_basis if sell_basis else 0.0
-                  body += f'卖出基准持仓：{sell_basis:.0f}股\n当前累计实际卖出：{basis_pct*100:.2f}%\n'
-              if reconstruction_warnings:
-                  body += '\n交易记录恢复警告：\n' + '\n'.join('- ' + w for w in reconstruction_warnings)
-              subject = '⚠️ TQQQ V2.0：买入信号' if action == 'buy' else '⚠️ TQQQ V2.0：卖出信号'
-              send_email(subject, body)
-              print('✅ TQQQ交易信号邮件已发送')
+              raise RuntimeError(
+                  f'TQQQ最新Yahoo数据为 {tqqq.iloc[-1]["date"]}，'
+                  f'但最近完整NYSE交易日为 {latest_date}；数据尚未可靠更新。'
+              )
+
+          # 月末Close：使用每个自然月最后一个美国交易日的正规收盘价
+          tqqq['month'] = pd.to_datetime(tqqq['date']).dt.to_period('M')
+          t_monthly = tqqq.groupby('month')['close'].last().sort_index()
+          if len(t_monthly) < 61:
+              raise RuntimeError('TQQQ有效完整月线不足61个月，无法可靠计算当日M60及上一交易日M60')
+
+          def calc_d60_for_date(date_text):
+              row = tqqq[tqqq['date'] == date_text]
+              if row.empty:
+                  raise RuntimeError(f'TQQQ缺少交易日 {date_text}')
+              close = float(row.iloc[-1]['close'])
+              month = pd.Period(date_text, freq='M')
+              prior_months = t_monthly[t_monthly.index < month].tail(60)
+              if len(prior_months) < 60:
+                  raise RuntimeError(f'{date_text}计算M60时不足60个完整月')
+              m60 = float(prior_months.mean())
+              d60 = close / m60 - 1
+              return close, m60, d60
+
+          t_close, t_m60, t_d60 = calc_d60_for_date(latest_date)
+          p_d60 = None
+          if prev_date:
+              _, _, p_d60 = calc_d60_for_date(prev_date)
+
+          print('------------------------------------------')
+          print(f'TQQQ数据源：{tqqq_host}')
+          print(f'TQQQ收盘：{t_close:.2f}')
+          print(f'适用M60：{t_m60:.2f}')
+          print(f'D60：{t_d60*100:.2f}%')
+
+          buy_levels = [0.00, -0.10, -0.20, -0.30, -0.40]
+          sell_levels = [0.50, 1.00, 1.50, 2.00, 2.50]
+
+          def reached_buy_level(d):
+              reached = [x for x in buy_levels if d <= x]
+              return min(reached) if reached else None
+
+          def reached_sell_level(d):
+              reached = [x for x in sell_levels if d >= x]
+              return max(reached) if reached else None
+
+          today_buy = reached_buy_level(t_d60)
+          prev_buy = reached_buy_level(p_d60) if p_d60 is not None else None
+          today_sell = reached_sell_level(t_d60)
+          prev_sell = reached_sell_level(p_d60) if p_d60 is not None else None
+
+          new_buy = today_buy is not None and (prev_buy is None or today_buy < prev_buy)
+          new_sell = today_sell is not None and (prev_sell is None or today_sell > prev_sell)
+
+          # 如果当天一次跨越多个买档，邮件只报告当天达到的最高买档；卖出同理报告最高累计目标。
+          if new_buy:
+              level_text = f'{today_buy*100:.0f}%'
+              if today_buy == 0:
+                  detail = 'D60 首次达到 0% 或更低，进入第一档买入区间。'
+              else:
+                  detail = f'D60 当日达到 {level_text} 买入档。'
+              body = (
+                  'TQQQ V2.0 新增买点信号\n\n'
+                  f'数据日期：{latest_date}\n'
+                  f'TQQQ正式收盘：${t_close:.2f}\n'
+                  f'适用M60：${t_m60:.2f}\n'
+                  f'D60：{t_d60*100:.2f}%\n\n'
+                  f'触发档位：{level_text}\n'
+                  f'{detail}\n\n'
+                  '说明：本程序不读取你的账户交易记录，因此只报告市场信号，\n'
+                  '不判断该档位你以前是否已经执行。请按你的TQQQ V2.0本轮状态自行确认是否执行。\n\n'
+                  '下一交易日：若该买入档位本轮尚未执行，按V2.0纪律处理。'
+              )
+              send_email(f'⚠️ TQQQ V2.0：新买点 {level_text}', body)
+              print('✅ 已发送TQQQ买点邮件。')
+
+          elif new_sell:
+              level_text = f'+{today_sell*100:.0f}%'
+              body = (
+                  'TQQQ V2.0 新增卖点信号\n\n'
+                  f'数据日期：{latest_date}\n'
+                  f'TQQQ正式收盘：${t_close:.2f}\n'
+                  f'适用M60：${t_m60:.2f}\n'
+                  f'D60：{t_d60*100:.2f}%\n\n'
+                  f'达到的最高累计卖出目标：{level_text}\n\n'
+                  '说明：本程序不读取你的账户交易记录，因此不计算具体卖出股数。\n'
+                  '请按你的TQQQ V2.0本轮状态，用“累计目标 − 已实际卖出比例”确定下一交易日数量。\n\n'
+                  '下一交易日：若本轮尚未完成该累计卖出目标，按V2.0纪律执行。'
+              )
+              send_email(f'⚠️ TQQQ V2.0：新卖点 {level_text}', body)
+              print('✅ 已发送TQQQ卖点邮件。')
           else:
-              print('🟢 今日无新的TQQQ V2.0交易信号，不发送常规邮件。')
+              print('ℹ️ 今日TQQQ没有新的买卖档位触发，不发送常规邮件。')
+
+          # ----------------------------------------------------------
+          # 2. QQQM：每月一次的月度定投报告
+          #
+          # 发送条件：
+          # 最近完整交易日属于上月的最后一个NYSE交易日，
+          # 且下一NYSE交易日对应“今天的北京时间日期”。
+          # 这样会在下个月第一个美国交易日开始前最近的北京时间08:00发送，
+          # 周末不会重复发送。
+          # ----------------------------------------------------------
+          qqqm_monthly_report = (
+              next_session is not None
+              and next_date == now_bj.strftime('%Y-%m-%d')
+              and latest_session == schedule.loc[
+                  str(pd.Period(latest_date, freq='M')) + '-01':
+              ].index[-1]
+              and pd.Period(latest_date, freq='M') < pd.Period(now_bj.strftime('%Y-%m'), freq='M')
+          )
+
+          if qqqm_monthly_report:
+              print('==========================================')
+              print('进入QQQM月度报告条件')
+              print('==========================================')
+
+              qqqm_host, qqqm = fetch_history('QQQM', '15y')
+
+              # QQQM在月末后早晨有时会出现Yahoo历史接口滞后。
+              # 这种情况沿用已经验证过的StockAnalysis内嵌结构化历史数据补齐。
+              if qqqm.iloc[-1]['date'] != latest_date:
+                  print(
+                      f'⚠️ QQQM Yahoo最新为 {qqqm.iloc[-1]["date"]}，'
+                      f'目标为 {latest_date}，尝试备用历史源补齐。'
+                  )
+
+                  url = 'https://stockanalysis.com/etf/qqqm/history/'
+                  session = requests.Session(impersonate='chrome')
+                  try:
+                      response = session.get(url, timeout=30)
+                      response.raise_for_status()
+                      html = response.text
+                  finally:
+                      session.close()
+
+                  number = r'-?(?:\d+(?:\.\d+)?|\.\d+)'
+                  pattern = re.compile(
+                      rf'\{{a:(?P<a>{number}),c:(?P<c>{number}),h:(?P<h>{number}),l:(?P<l>{number}),o:(?P<o>{number}),t:"(?P<t>\d{{4}}-\d{{2}}-\d{{2}})"'
+                  )
+                  rows = []
+                  for match in pattern.finditer(html):
+                      rows.append({
+                          'date': match.group('t'),
+                          'open': float(match.group('o')),
+                          'high': float(match.group('h')),
+                          'low': float(match.group('l')),
+                          'close': float(match.group('c')),
+                      })
+                  supplemental = pd.DataFrame(rows).drop_duplicates('date', keep='last').sort_values('date')
+                  supplemental = supplemental[supplemental['date'] <= latest_date].copy()
+                  if supplemental.empty or supplemental.iloc[-1]['date'] != latest_date:
+                      send_email(
+                          '⚠️ QQQM月度报告：行情数据未更新',
+                          (
+                              f'北京时间：{now_bj.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                              f'应使用的最后完整交易日：{latest_date}\n'
+                              f'Yahoo最新：{qqqm.iloc[-1]["date"]}\n'
+                              '备用历史源也未取得最新完整交易日。\n\n'
+                              '本次不生成QQQM月度定投结论。'
+                          )
+                      )
+                      raise RuntimeError('QQQM月度报告缺少最新完整交易日数据')
+
+                  missing = supplemental[supplemental['date'] > qqqm.iloc[-1]['date']].copy()
+                  qqqm = pd.concat([qqqm, missing], ignore_index=True)
+                  qqqm = qqqm.drop_duplicates('date', keep='last').sort_values('date').reset_index(drop=True)
+                  qqqm_host = qqqm_host + ' + StockAnalysis补齐'
+
+              qqqm = qqqm[qqqm['date'] <= latest_date].copy()
+              qqqm['month'] = pd.to_datetime(qqqm['date']).dt.to_period('M')
+              q_monthly = qqqm.groupby('month')['close'].last().sort_index()
+
+              if len(q_monthly) < 60:
+                  raise RuntimeError('QQQM有效完整月线不足60个月')
+
+              report_month = q_monthly.index[-1]
+              report_close = float(q_monthly.iloc[-1])
+
+              q_month_df = pd.DataFrame({'Close': q_monthly})
+              for n in [5, 10, 20, 30, 60]:
+                  q_month_df[f'M{n}'] = q_month_df['Close'].rolling(n).mean()
+
+              report_row = q_month_df.loc[report_month]
+              broken = []
+              for n in [5, 10, 20, 30, 60]:
+                  ma = float(report_row[f'M{n}'])
+                  if report_close < ma:
+                      broken.append((n, ma))
+
+              # 当前最终V5.6文件已确认基础月投$800；
+              # 破线具体金额表此前尚未写进自动化，因此这里明确列出配置状态，不猜金额。
+              BASE_MONTHLY_BUY = 800.0
+              BREAK_BUY_AMOUNTS = {
+                  5: None,
+                  10: None,
+                  20: None,
+                  30: None,
+                  60: None,
+              }
+
+              if not broken:
+                  monthly_amount_text = f'${BASE_MONTHLY_BUY:,.0f}（基础月度定投）'
+              else:
+                  deepest = max(broken, key=lambda x: x[0])[0]
+                  configured = BREAK_BUY_AMOUNTS.get(deepest)
+                  if configured is None:
+                      monthly_amount_text = '尚未配置具体破线金额；程序不猜金额'
+                  else:
+                      monthly_amount_text = f'${configured:,.0f}'
+
+              body_lines = [
+                  'QQQM月度定投确认报告',
+                  '',
+                  f'报告月份：{report_month}',
+                  f'上月月末正式收盘：${report_close:.2f}',
+                  f'数据源：{qqqm_host}',
+                  '',
+              ]
+
+              if not broken:
+                  body_lines += [
+                      '月线结论：未跌破M5/M10/M20/M30/M60。',
+                      f'按V5.6基础纪律：下月基础定投 ${BASE_MONTHLY_BUY:,.0f}。',
+                  ]
+              else:
+                  broken_text = ', '.join(f'M{n}' for n, _ in broken)
+                  body_lines += [
+                      f'月线结论：已跌破 {broken_text}。',
+                      f'最深破线：M{max(n for n, _ in broken)}。',
+                      f'按当前自动化金额配置：{monthly_amount_text}。',
+                  ]
+
+              body_lines += ['', '各月线：']
+              for n in [5, 10, 20, 30, 60]:
+                  ma = float(report_row[f'M{n}'])
+                  diff = report_close / ma - 1
+                  status = '破线' if report_close < ma else '未破线'
+                  body_lines.append(f'M{n}：${ma:.2f}，收盘相对均线 {diff*100:.2f}%，{status}')
+
+              body_lines += [
+                  '',
+                  '说明：本月度报告只判断上个月正式月线破线情况。',
+                  '不考虑上个月盘中是否曾经触发QQQM 13%急跌。',
+                  'QQQM盘中13%急跌由独立盘中模块实时监控。',
+              ]
+
+              send_email(f'QQQM月度定投确认：{report_month}', '\n'.join(body_lines))
+              print('✅ QQQM月度报告已发送。')
+          else:
+              print('ℹ️ 今天不是QQQM月度报告发送日。')
           PY
