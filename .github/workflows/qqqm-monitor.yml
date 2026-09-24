@@ -462,6 +462,7 @@ jobs:
           import os
           import re
           import smtplib
+          import time
           from email.message import EmailMessage
 
           import pandas as pd
@@ -531,12 +532,18 @@ jobs:
               for host in YAHOO_HOSTS:
                   try:
                       url = f'https://{host}/v8/finance/chart/{ticker}'
+                      now_ts = pd.Timestamp.now(tz='UTC')
+                      period1 = int((now_ts - pd.Timedelta(days=15 * 365 + 5)).timestamp())
+                      period2 = int((now_ts + pd.Timedelta(days=2)).timestamp())
                       params = {
-                          'range': range_text,
+                          # 使用明确时间区间 + 时间戳参数，尽量避免Yahoo Chart API沿用旧缓存。
+                          'period1': period1,
+                          'period2': period2,
                           'interval': '1d',
                           'events': 'div,splits',
                           'includeAdjustedClose': 'true',
                           'includePrePost': 'false',
+                          '_': int(time.time()),
                       }
                       session = requests.Session(impersonate='chrome')
                       try:
@@ -606,20 +613,108 @@ jobs:
           # ----------------------------------------------------------
           # 1. TQQQ V2.0 收盘信号
           # ----------------------------------------------------------
+          # Yahoo历史接口有时会滞后一个交易日。若滞后，沿用QQQM已经验证过的
+          # StockAnalysis内嵌结构化历史数据补齐机制，而不是直接判定为失败。
           tqqq_host, tqqq = fetch_history('TQQQ', '15y')
-          if tqqq.iloc[-1]['date'] != latest_date:
-              send_email(
-                  '⚠️ TQQQ监控：行情数据未更新',
-                  (
-                      f'北京时间：{now_bj.strftime("%Y-%m-%d %H:%M:%S")}\n'
-                      f'最近完整NYSE交易日：{latest_date}\n'
-                      f'TQQQ Yahoo最新数据：{tqqq.iloc[-1]["date"]}\n\n'
-                      '本次无法可靠计算正式D60交易信号，因此不产生交易指令。'
-                  )
+
+          def fetch_stockanalysis_history(ticker, target_date=None):
+              url = f'https://stockanalysis.com/etf/{ticker.lower()}/history/'
+              session = requests.Session(impersonate='chrome')
+              try:
+                  response = session.get(url, timeout=30)
+                  response.raise_for_status()
+                  html = response.text
+              finally:
+                  session.close()
+
+              number = r'-?(?:\d+(?:\.\d+)?|\.\d+)'
+              pattern = re.compile(
+                  rf'\{{a:(?P<a>{number}),c:(?P<c>{number}),h:(?P<h>{number}),l:(?P<l>{number}),o:(?P<o>{number}),t:"(?P<t>\d{{4}}-\d{{2}}-\d{{2}})"'
               )
+              rows = []
+              for match in pattern.finditer(html):
+                  rows.append({
+                      'date': match.group('t'),
+                      'open': float(match.group('o')),
+                      'high': float(match.group('h')),
+                      'low': float(match.group('l')),
+                      'close': float(match.group('c')),
+                  })
+
+              df = (
+                  pd.DataFrame(rows)
+                  .drop_duplicates('date', keep='last')
+                  .sort_values('date')
+                  .reset_index(drop=True)
+              )
+              if df.empty:
+                  raise RuntimeError(f'StockAnalysis未解析出{ticker}历史数据')
+              if target_date:
+                  df = df[df['date'] <= target_date].copy()
+              if df.empty:
+                  raise RuntimeError(f'StockAnalysis没有不晚于{target_date}的{ticker}数据')
+              return df
+
+          if tqqq.iloc[-1]['date'] != latest_date:
+              yahoo_latest = tqqq.iloc[-1]['date']
+              print(
+                  f'⚠️ TQQQ Yahoo最新为 {yahoo_latest}，目标为 {latest_date}；'
+                  '尝试使用StockAnalysis历史数据补齐。'
+              )
+
+              try:
+                  supplemental = fetch_stockanalysis_history('TQQQ', latest_date)
+                  if supplemental.iloc[-1]['date'] != latest_date:
+                      raise RuntimeError(
+                          f'StockAnalysis最新为 {supplemental.iloc[-1]["date"]}，'
+                          f'仍未到目标交易日 {latest_date}'
+                      )
+
+                  if prev_date:
+                      yprev = tqqq[tqqq['date'] == prev_date]
+                      sprev = supplemental[supplemental['date'] == prev_date]
+                      if not yprev.empty and not sprev.empty:
+                          yp = float(yprev.iloc[-1]['close'])
+                          sp = float(sprev.iloc[-1]['close'])
+                          diff = abs(yp - sp) / yp if yp else 0.0
+                          print(f'TQQQ备用源前一交易日价格差异：{diff*100:.4f}%')
+                          if diff > PRICE_DIFF_LIMIT:
+                              raise RuntimeError(
+                                  f'TQQQ备用源与Yahoo前一交易日价格差异过大：{diff*100:.4f}%'
+                              )
+
+                  missing = supplemental[supplemental['date'] > yahoo_latest].copy()
+                  tqqq = pd.concat([tqqq, missing], ignore_index=True)
+                  tqqq = (
+                      tqqq
+                      .drop_duplicates('date', keep='last')
+                      .sort_values('date')
+                      .reset_index(drop=True)
+                  )
+                  tqqq_host = tqqq_host + ' + StockAnalysis补齐'
+                  print(
+                      f'✅ 已补齐TQQQ最新交易日：{latest_date}，'
+                      f'收盘：{float(tqqq.iloc[-1]["close"]):.2f}'
+                  )
+              except Exception as exc:
+                  send_email(
+                      '⚠️ TQQQ监控：行情数据未更新',
+                      (
+                          f'北京时间：{now_bj.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                          f'最近完整NYSE交易日：{latest_date}\n'
+                          f'TQQQ Yahoo最新数据：{yahoo_latest}\n'
+                          f'StockAnalysis补齐失败：{exc}\n\n'
+                          '本次无法可靠计算正式D60交易信号，因此不产生交易指令。'
+                      )
+                  )
+                  raise RuntimeError(
+                      f'TQQQ最新Yahoo数据为 {yahoo_latest}，'
+                      f'但最近完整NYSE交易日为 {latest_date}；备用历史源也未能可靠补齐：{exc}'
+                  )
+
+          if tqqq.iloc[-1]['date'] != latest_date:
               raise RuntimeError(
-                  f'TQQQ最新Yahoo数据为 {tqqq.iloc[-1]["date"]}，'
-                  f'但最近完整NYSE交易日为 {latest_date}；数据尚未可靠更新。'
+                  f'TQQQ数据最终仍未到达 {latest_date}，无法计算正式D60。'
               )
 
           # 月末Close：使用每个自然月最后一个美国交易日的正规收盘价
