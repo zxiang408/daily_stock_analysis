@@ -132,14 +132,15 @@ jobs:
           STATE_DIR = '.monitor_state'
           STATE_FILE = os.path.join(STATE_DIR, 'qqqm_acute_alert.json')
 
-          # V5.6破线金额配置。必须填写你最终确认的五档金额；程序不会自行猜测。
+          # QQQM V5.6月度定投金额
+          # 按上个月完整月末收盘相对于完整月线的位置确定下月基础定投金额。
           BASE_MONTHLY_BUY = 800.0
-          BREAK_BUY_AMOUNTS = {
-              5: None,
-              10: None,
-              20: None,
-              30: None,
-              60: None,
+          MONTHLY_BUY_RULES = {
+              "above_m5": 800.0,
+              "m5_to_m10": 1300.0,
+              "m10_to_m20": 1800.0,
+              "m20_to_m30": 2500.0,
+              "below_m30": 3000.0,
           }
 
           def output(name, value):
@@ -364,16 +365,35 @@ jobs:
           latest_price = float(latest['close'])
           broken_lines = broken_month_lines(latest_price)
           broken_text = '、'.join(f'M{n}' for n in broken_lines) if broken_lines else '无'
+
+          # 13%急跌邮件同时给出“当前价格所处月线区间对应的V5.6定投金额”。
+          # 注意：这里显示的是按当前位置对应的月度定投档位，不代表当月已经正式月末确认。
+          if latest_price >= monthly_ma[5]:
+              position_buy_amount = MONTHLY_BUY_RULES["above_m5"]
+              position_text = f'QQQM ≥ M5 → ${position_buy_amount:,.0f}'
+          elif latest_price >= monthly_ma[10]:
+              position_buy_amount = MONTHLY_BUY_RULES["m5_to_m10"]
+              position_text = f'M5 > QQQM ≥ M10 → ${position_buy_amount:,.0f}'
+          elif latest_price >= monthly_ma[20]:
+              position_buy_amount = MONTHLY_BUY_RULES["m10_to_m20"]
+              position_text = f'M10 > QQQM ≥ M20 → ${position_buy_amount:,.0f}'
+          elif latest_price >= monthly_ma[30]:
+              position_buy_amount = MONTHLY_BUY_RULES["m20_to_m30"]
+              position_text = f'M20 > QQQM ≥ M30 → ${position_buy_amount:,.0f}'
+          else:
+              position_buy_amount = MONTHLY_BUY_RULES["below_m30"]
+              position_text = f'QQQM < M30 → ${position_buy_amount:,.0f}'
+
           if broken_lines:
-              deepest = max(broken_lines)
-              configured_amount = BREAK_BUY_AMOUNTS.get(deepest)
               rule_buy_text = (
-                  f'最深破线M{deepest}；按V5.6该档应买入${configured_amount:,.0f}'
-                  if configured_amount is not None
-                  else f'最深破线M{deepest}；M{deepest}对应买入金额尚未配置'
+                  f'当前价格已跌破月线：{broken_text}；'
+                  f'按月线位置对应的V5.6定投金额：{position_text}'
               )
           else:
-              rule_buy_text = '当前价未跌破M5/M10/M20/M30/M60'
+              rule_buy_text = (
+                  f'当前价格未跌破M5/M10/M20/M30/M60；'
+                  f'按月线位置对应的V5.6定投金额：{position_text}'
+              )
 
           body = (
               'QQQM V5.6 盘中13%急跌报警\n\n'
@@ -787,26 +807,41 @@ jobs:
                   if report_close < ma:
                       broken.append((n, ma))
 
-              # 当前最终V5.6文件已确认基础月投$800；
-              # 破线具体金额表此前尚未写进自动化，因此这里明确列出配置状态，不猜金额。
+              # 用户最终确认的QQQM V5.6月度定投金额
               BASE_MONTHLY_BUY = 800.0
-              BREAK_BUY_AMOUNTS = {
-                  5: None,
-                  10: None,
-                  20: None,
-                  30: None,
-                  60: None,
+              MONTHLY_BUY_RULES = {
+                  "above_m5": 800.0,
+                  "m5_to_m10": 1300.0,
+                  "m10_to_m20": 1800.0,
+                  "m20_to_m30": 2500.0,
+                  "below_m30": 3000.0,
               }
 
-              if not broken:
-                  monthly_amount_text = f'${BASE_MONTHLY_BUY:,.0f}（基础月度定投）'
+              # 严格按用户给定区间判断下月基础定投金额。
+              # 等号归属：QQQM ≥ M5、M5 > QQQM ≥ M10、M10 > QQQM ≥ M20、
+              # M20 > QQQM ≥ M30、QQQM < M30。
+              m5 = float(report_row['M5'])
+              m10 = float(report_row['M10'])
+              m20 = float(report_row['M20'])
+              m30 = float(report_row['M30'])
+
+              if report_close >= m5:
+                  monthly_amount = MONTHLY_BUY_RULES["above_m5"]
+                  position_text = 'QQQM ≥ M5'
+              elif report_close >= m10:
+                  monthly_amount = MONTHLY_BUY_RULES["m5_to_m10"]
+                  position_text = 'M5 > QQQM ≥ M10'
+              elif report_close >= m20:
+                  monthly_amount = MONTHLY_BUY_RULES["m10_to_m20"]
+                  position_text = 'M10 > QQQM ≥ M20'
+              elif report_close >= m30:
+                  monthly_amount = MONTHLY_BUY_RULES["m20_to_m30"]
+                  position_text = 'M20 > QQQM ≥ M30'
               else:
-                  deepest = max(broken, key=lambda x: x[0])[0]
-                  configured = BREAK_BUY_AMOUNTS.get(deepest)
-                  if configured is None:
-                      monthly_amount_text = '尚未配置具体破线金额；程序不猜金额'
-                  else:
-                      monthly_amount_text = f'${configured:,.0f}'
+                  monthly_amount = MONTHLY_BUY_RULES["below_m30"]
+                  position_text = 'QQQM < M30'
+
+              monthly_amount_text = f'${monthly_amount:,.0f}'
 
               body_lines = [
                   'QQQM月度定投确认报告',
@@ -820,14 +855,16 @@ jobs:
               if not broken:
                   body_lines += [
                       '月线结论：未跌破M5/M10/M20/M30/M60。',
-                      f'按V5.6基础纪律：下月基础定投 ${BASE_MONTHLY_BUY:,.0f}。',
+                      f'下月QQQM位置：{position_text}。',
+                      f'按V5.6纪律：下月基础定投 {monthly_amount_text}。',
                   ]
               else:
                   broken_text = ', '.join(f'M{n}' for n, _ in broken)
                   body_lines += [
                       f'月线结论：已跌破 {broken_text}。',
                       f'最深破线：M{max(n for n, _ in broken)}。',
-                      f'按当前自动化金额配置：{monthly_amount_text}。',
+                      f'QQQM位置档位：{position_text}。',
+                      f'按V5.6纪律：下月基础定投 {monthly_amount_text}。',
                   ]
 
               body_lines += ['', '各月线：']
@@ -838,6 +875,13 @@ jobs:
                   body_lines.append(f'M{n}：${ma:.2f}，收盘相对均线 {diff*100:.2f}%，{status}')
 
               body_lines += [
+                  '',
+                  'V5.6定投金额规则：',
+                  'QQQM ≥ M5：$800',
+                  'M5 > QQQM ≥ M10：$1,300',
+                  'M10 > QQQM ≥ M20：$1,800',
+                  'M20 > QQQM ≥ M30：$2,500',
+                  'QQQM < M30：$3,000',
                   '',
                   '说明：本月度报告只判断上个月正式月线破线情况。',
                   '不考虑上个月盘中是否曾经触发QQQM 13%急跌。',
